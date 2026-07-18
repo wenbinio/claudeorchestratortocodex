@@ -25,6 +25,20 @@ Inspect the actual repository before drafting any task. Every spec must:
 - Prefer a file set disjoint from every other task. If a shared file is unavoidable, give the tasks different insertion anchors and anticipate a small integration conflict.
 - Tell Codex what to implement, but never ask Codex to run tests or local toolchains. Codex's sandbox cannot do that reliably; the Claude driver runs verification outside it.
 
+## Choose the dispatch backend
+
+Select the highest available backend; all three converge on the SAME review + verdict-state + integration steps below.
+
+1. **App-server runner (v0.2, preferred when `config.backend === 'app-server'` and node is available).** Write a batch file to a temp path — `{repo, codexExe, model, effort, tasks, verify, timeoutMinutes}` — then run the whole dispatch phase in ONE command:
+
+   ```
+   node "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
+   ```
+
+   Read `<repo>/.codex-fleet/results.json` (`{results, approvedBranches:[], worktreeBase}`). This backend uses the vendored `codex app-server` transport for sessionful workers (no `codex exec` stdin hang, no shell-timeout ceiling; corrections are follow-up turns on the same warm thread). It performs ONLY the dispatch phase — you then spawn reviewer agents per branch (below) exactly as with the other backends.
+2. **Workflow engine** (when the Workflow tool is available): the `Workflow({scriptPath, args})` call below.
+3. **Agent-tool orchestration** (stock installs with neither): the prose fallback further down.
+
 ## Invoke the workflow
 
 Use the Workflow tool, never a raw shell replacement:

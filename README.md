@@ -68,14 +68,30 @@ Codex worker usage bills to your OpenAI plan. Fleet runs also consume Claude tok
 
 At release, the POSIX driver path, the second-Windows-machine path, and the cloud sandbox surface remain untested by a real run. Those first runs are the validation for those environments; cloud data-directory persistence may require rerunning setup per session.
 
+## v0.2: app-server backend
+
+When Node >= 18 is present, `setup` selects the `app-server` backend. Instead of one-shot `codex exec` processes, workers run as sessionful Codex threads over the `codex app-server` JSON-RPC transport: no stdin-close hang, no 10-minute shell-timeout ceiling (the runner owns its own timeouts), and correction rounds are follow-up turns on the same warm thread rather than cold re-prompts. It also runs on any machine with Node, independent of the in-editor Workflow tool.
+
+Standalone, outside a Claude session:
+
+```
+node runner/fleet-runner.mjs --batch batch.json
+```
+
+The batch is `{repo, codexExe, tasks:[{id,spec,verify?}], model?, effort?, timeoutMinutes?}`; it writes `<repo>/.codex-fleet/results.json`. Review and integration remain the dispatch skill's job — the runner performs only the dispatch phase.
+
+The app-server transport and sessionful-worker layer under `vendor/dynamic-workflows-codex/` are **vendored verbatim** from [scasella/claude-dynamic-workflows-codex](https://github.com/scasella/claude-dynamic-workflows-codex) (MIT, © Stephen Casella). Their license and provenance are preserved in [`vendor/dynamic-workflows-codex/LICENSE`](vendor/dynamic-workflows-codex/LICENSE) and [`NOTICE.md`](vendor/dynamic-workflows-codex/NOTICE.md). Node >= 18 is optional but recommended.
+
 ## Architecture
 
 - Two skills: `setup` and `dispatch`
-- One workflow engine: `workflows/codex-fleet.js`
+- One workflow engine: `workflows/codex-fleet.js` (`exec` backend) plus `runner/fleet-runner.mjs` (`app-server` backend, over vendored transport)
 - Two agents: `codex-driver` and `fleet-reviewer`
 - One merge-guard hook with Windows and POSIX scripts
 - Persistent data-directory files: `config.json`, `fleet-log.jsonl`, `approved.json`, and per-worker files under `transcripts/`
+- Vendored third-party code under `vendor/` (see its `NOTICE.md`)
 
 ## License
 
 Released under the [MIT License](LICENSE). Copyright 2026 wenbinio.
+Vendored code under `vendor/` retains its own upstream MIT license and copyright (see `vendor/dynamic-workflows-codex/`).

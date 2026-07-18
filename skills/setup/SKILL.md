@@ -45,9 +45,16 @@ Classify `authMode` from the successful smoke:
 
 Do not start an interactive OAuth flow in a headless or cloud session.
 
+## Detect the runner backend (v0.2)
+
+Run `node --version`. If Node is present and the major version is >= 18, the fast
+app-server backend is available: record `backend` as `app-server` and `nodeExe`
+as the resolved node path. Otherwise record `backend` as `exec` and `nodeExe` as
+`null` — the plugin then uses the `codex exec` path or Claude-only fallback.
+
 ## Write configuration
 
-Write `<dataDir>/config.json` with exactly these six keys and no credentials:
+Write `<dataDir>/config.json` with exactly these eight keys and no credentials:
 
 ```json
 {
@@ -56,6 +63,8 @@ Write `<dataDir>/config.json` with exactly these six keys and no credentials:
   "authMode": "subscription",
   "model": "gpt-5.6-sol",
   "effort": "xhigh",
+  "backend": "app-server",
+  "nodeExe": "<absolute node path, or null>",
   "verifiedAt": "<ISO-8601 UTC timestamp>"
 }
 ```

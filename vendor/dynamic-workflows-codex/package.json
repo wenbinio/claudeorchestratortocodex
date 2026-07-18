@@ -1,0 +1,7 @@
+{
+  "name": "dynamic-workflows-codex-vendored",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Module-resolution marker for the vendored ESM sources. Upstream shipped type:module in runner/package.json; only src/ was copied, so this re-declares it. See NOTICE.md."
+}
