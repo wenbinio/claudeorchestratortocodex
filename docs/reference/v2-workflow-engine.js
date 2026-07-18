@@ -1,3 +1,5 @@
+// Historical v2 Workflow-tool implementation retained for reference only.
+// v0.3 dispatch must not invoke this file; the runner-first lifecycle is normative.
 export const meta = {
   name: 'codex-fleet',
   description: 'Fan coding tasks out to isolated Codex CLI or Claude workers, verify and correct once, commit, and adversarially review each branch',

@@ -45,12 +45,15 @@ Classify `authMode` from the successful smoke:
 
 Do not start an interactive OAuth flow in a headless or cloud session.
 
-## Detect the runner backend (v0.2)
+## Probe the runner backend (v0.3)
 
-Run `node --version`. If Node is present and the major version is >= 18, the fast
-app-server backend is available: record `backend` as `app-server` and `nodeExe`
-as the resolved node path. Otherwise record `backend` as `exec` and `nodeExe` as
-`null` — the plugin then uses the `codex exec` path or Claude-only fallback.
+Resolve Node to an absolute `nodeExe` and run `<nodeExe> --version`. Node is usable only when the executable exists and its major version is >= 18. When `mode` will be `codex` (`authMode` is `subscription` or `api_key`) and both absolute `codexExe` and usable absolute `nodeExe` are present, run this capability probe with the absolute paths:
+
+```text
+"<absolute nodeExe>" "<absolute plugin root>/runner/fleet-runner.mjs" --probe
+```
+
+The probe must initialize `codex app-server`, list its models, and complete one ephemeral read-only turn. Record `backend` as `app-server` only when all three steps succeed and the runner reports compatibility. If the probe fails or reports incompatibility, record `backend` as `exec`; keep `nodeExe` set to its absolute path so the runner can use its `exec` transport. Re-run the probe whenever the Codex or Node version changes. If Node is missing or older than 18, record `backend` as `exec` and `nodeExe` as `null`; dispatch then uses the no-Node Agent-tool fallback (or the Claude-only fallback when `authMode` is `none`).
 
 ## Write configuration
 
@@ -69,6 +72,6 @@ Write `<dataDir>/config.json` with exactly these eight keys and no credentials:
 }
 ```
 
-Use the actual `platform` and `authMode`; encode `codexExe` as JSON `null` when unavailable. `model` and `effort` default to `gpt-5.6-sol` / `xhigh`; honor explicit values from the machine's `~/.codex/config.toml` when present so fleet workers match the user's chosen model. Set `verifiedAt` to the time this setup attempt completed. Report the config path, discovered executable, platform, and authentication classification without exposing any secret.
+Use the actual `platform` and `authMode`; encode `codexExe` as JSON `null` when unavailable. `model` and `effort` default to `gpt-5.6-sol` / `xhigh`; honor explicit values from the machine's `~/.codex/config.toml` when present so fleet workers match the user's chosen model. Set `backend` from the capability probe above, never from Node presence alone, and set `nodeExe` to the absolute usable path or JSON `null`. Set `verifiedAt` to the time this setup attempt completed. Report the config path, discovered executable, platform, authentication classification, and selected backend without exposing any secret.
 
 If `authMode` is `none`, explain that `/codex-fleet:dispatch` will run the same worktree, verification, review, and integration pipeline in Claude-only mode. The plugin data directory's persistence in cloud sandboxes is unverified, so setup may need to be run again in each cloud session.
