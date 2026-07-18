@@ -58,7 +58,7 @@ Add `OPENAI_API_KEY` as an environment secret. Skills and agents load in cloud s
 
 ## Merge guard
 
-The merge guard is an advisory seatbelt, not a security boundary. It gates Claude's own shell-tool calls only; it never affects commands you run in your terminal. It matches `git merge` and `git merge --squash` of `codex/*` branches and checks verdicts keyed to the branch tip SHA. Missing or corrupt state, script errors, and SHA mismatches fail open by design. Rebase, cherry-pick, and pull are not matched. The dispatch pipeline's verdict and verification protocol is the real enforcement.
+The merge guard is an advisory seatbelt, not a security boundary. It gates Claude's own shell-tool calls only; it never affects commands you run in your terminal. It matches `git merge` and `git merge --squash` of `codex/*` branches and checks verdicts keyed to the branch tip SHA. A recorded branch whose tip no longer matches its reviewed SHA is blocked as unreviewed because the branch changed after review. Fail-open is limited to unknown repositories, unknown branches, missing or corrupt state, and guard errors. Rebase, cherry-pick, and pull are not matched. The dispatch pipeline's verdict and verification protocol is the real enforcement.
 
 ## Costs
 
@@ -68,9 +68,13 @@ Codex worker usage bills to your OpenAI plan. Fleet runs also consume Claude tok
 
 At release, the POSIX driver path, the second-Windows-machine path, and the cloud sandbox surface remain untested by a real run. Those first runs are the validation for those environments; cloud data-directory persistence may require rerunning setup per session.
 
+## v0.3: runner-first lifecycle
+
+v0.3 unifies Codex dispatch on one runner-first lifecycle: worktree creation, Codex turns, quiescence, verification, one correction round, checked commit, and transcript generation follow one code path. App-server and `codex exec` are transport choices behind that lifecycle. The former Workflow-tool engine is retained only as [`docs/reference/v2-workflow-engine.js`](docs/reference/v2-workflow-engine.js); it is a historical reference, not a backend or the normative pipeline contract. Stock installations without Node and Claude-only mode continue through the Agent-tool prose fallback.
+
 ## v0.2: app-server backend
 
-When Node >= 18 is present, `setup` selects the `app-server` backend. Instead of one-shot `codex exec` processes, workers run as sessionful Codex threads over the `codex app-server` JSON-RPC transport: no stdin-close hang, no 10-minute shell-timeout ceiling (the runner owns its own timeouts), and correction rounds are follow-up turns on the same warm thread rather than cold re-prompts. It also runs on any machine with Node, independent of the in-editor Workflow tool.
+When Node >= 18 is present and the runner's app-server capability probe succeeds, `setup` selects the `app-server` backend; otherwise it records the `exec` transport. Instead of one-shot `codex exec` processes, app-server workers run as sessionful Codex threads over the `codex app-server` JSON-RPC transport: no stdin-close hang, no 10-minute shell-timeout ceiling (the runner owns its own timeouts), and correction rounds are follow-up turns on the same warm thread rather than cold re-prompts. The runner works independently of the in-editor Workflow tool.
 
 Standalone, outside a Claude session:
 
@@ -85,7 +89,7 @@ The app-server transport and sessionful-worker layer under `vendor/dynamic-workf
 ## Architecture
 
 - Two skills: `setup` and `dispatch`
-- One workflow engine: `workflows/codex-fleet.js` (`exec` backend) plus `runner/fleet-runner.mjs` (`app-server` backend, over vendored transport)
+- One runner-first lifecycle with app-server and `codex exec` transports; `docs/reference/v2-workflow-engine.js` is reference-only
 - Two agents: `codex-driver` and `fleet-reviewer`
 - One merge-guard hook with Windows and POSIX scripts
 - Persistent data-directory files: `config.json`, `fleet-log.jsonl`, `approved.json`, and per-worker files under `transcripts/`

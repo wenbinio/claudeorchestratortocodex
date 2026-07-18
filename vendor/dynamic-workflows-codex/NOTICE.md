@@ -13,10 +13,12 @@ They are not original to codex-fleet.
 
 ## Why this is here
 
-codex-fleet's v0.2 app-server backend uses upstream's `appServerClient.js`
-(JSON-RPC transport for `codex app-server`) and `codexSession.js` (sessionful
-thread/turn worker) rather than reimplementing them. The remaining modules are
-kept intact so the vendored module graph resolves without edits.
+codex-fleet's v0.2 app-server backend wired only upstream's
+`appServerClient.js` (the JSON-RPC transport for `codex app-server`). Although
+`codexSession.js` was included in the vendored module set, v0.2 did not import
+or use it. As of v0.3, codex-fleet adopts the vendored `codexSession.js` as its
+sessionful thread/turn worker. The remaining modules are kept intact so the
+vendored module graph resolves without edits.
 
 ## Compliance
 

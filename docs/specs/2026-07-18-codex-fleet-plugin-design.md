@@ -35,7 +35,7 @@ claudeorchestratortocodex/
 ├── scripts/
 │   ├── merge-guard.ps1       # Windows guard
 │   └── merge-guard.sh        # POSIX guard
-├── workflows/codex-fleet.js  # the engine (Workflow-tool script)
+├── docs/reference/v2-workflow-engine.js  # historical Workflow-tool reference; non-normative after A9
 ├── docs/specs/               # this document
 └── README.md                 # human-facing install + sandbox + API-key instructions
 ```
@@ -44,11 +44,11 @@ Skills are invoked namespaced: `/codex-fleet:dispatch`, `/codex-fleet:setup`.
 
 ## Components
 
-### Engine (`workflows/codex-fleet.js`)
+### Historical v2 engine reference (`docs/reference/v2-workflow-engine.js`; superseded by A9)
 
-Ported from the working v1 with these changes:
+The original Workflow-tool engine was ported from the working v1 with these changes. As of v0.3 it is retained only as a non-normative reference; the runner-first lifecycle in A9 is authoritative:
 
-- **`cfg.mode`** (`"codex"` | `"claude"`, default `"codex"`): the engine owns the Claude-only fallback. In `codex` mode, drivers dispatch Codex CLI and are forbidden from editing project source. In `claude` mode (set by dispatch when `authMode: none`), the driver prompt swaps the "dispatch Codex" step for "implement the task spec yourself" — everything else (worktree, verify, correction round, commit, adversarial review, return contract, telemetry inputs) is identical. The fallback is NOT reimplemented in skill prose; the engine is the single owner of the pipeline in both modes.
+- **`cfg.mode`** (`"codex"` | `"claude"`, default `"codex"`): the historical engine owned the Claude-only fallback. In `codex` mode, drivers dispatched Codex CLI and were forbidden from editing project source. In `claude` mode (set by dispatch when `authMode: none`), the driver prompt swapped the "dispatch Codex" step for "implement the task spec yourself". A9 supersedes this ownership model: the runner owns the normative Codex lifecycle, and skill prose owns the no-Node/Claude-only Agent-tool fallback.
 - **`cfg.codexExe` argument** replaces the hard-coded `CODEX` const — required when `mode` is `codex` (throw early with "run /codex-fleet:setup"), ignored in `claude` mode. Dispatch skill supplies it from machine config.
 - **`cfg.platform`** (`"windows"` | `"posix"`) selects idioms inside driver prompts:
   - stdin close: `$null | & <exe> exec ...` (Windows) vs `<exe> exec ... < /dev/null` (POSIX). Without this, `codex exec` hangs forever on piped stdin ("Reading additional input from stdin...").
@@ -83,7 +83,7 @@ The v1 `/fleet` skill generalized:
 
 - Reads `config.json`; missing → instruct running `/codex-fleet:setup` first.
 - Spec-writing rules (unchanged from v1): ground specs in actual code first with file/line anchors; surgical single-concern test-anchored tasks; explicit "Do not modify X"; prefer disjoint file sets, pin different insertion anchors when a shared file is unavoidable; never ask Codex to run tests (its sandbox cannot execute local toolchains — driver verifies outside).
-- Invokes the engine: `Workflow({scriptPath: '<plugin root>/workflows/codex-fleet.js', args: {repo, mode, codexExe, platform, verify, tasks}})` — `mode` from `authMode` (`none` → `claude`, else `codex`).
+- Historical v2 behavior invoked the Workflow-tool implementation now retained at `docs/reference/v2-workflow-engine.js`. A9 supersedes that path: dispatch must not invoke the reference as a backend.
 - Merge protocol *[superseded by A1 — this v1 flow survives only as `integrate: "commit"` mode]*: clear untracked local build artifacts first; per branch best-verdict-first `git merge --no-ff --no-commit` → `git rm` review-flagged strays → commit; FULL project verification after each merge; abort/drop on failure; worktree remove + branch delete; report.
 - **Telemetry (new, C):** after each run, append one JSON line to `${CLAUDE_PLUGIN_DATA}/fleet-log.jsonl` (`{ts, repo, taskIds, verdicts, approvedBranches, subagentTokens}`) and update `${CLAUDE_PLUGIN_DATA}/approved.json` *[flat-string schema and "rewrite" wording superseded by A3: sha-keyed entry objects, read-modify-write, write-before-integrate]* for the merge-guard. `subagentTokens` comes from the harness's workflow-completion usage report (the `subagent_tokens` figure in the task notification), not from the engine's return value; if unavailable, the field is omitted rather than fabricated.
 - **Claude-only fallback:** when `authMode: none`, the same pipeline runs with Claude subagents implementing instead of Codex (worktrees, verify, review, merge protocol all identical).
@@ -234,7 +234,7 @@ The v1 driver prompt is pervasively PowerShell (~10 backslash-joined paths, `New
 
 **Components (v0.2):**
 
-1. **App-server client — VENDORED, not built:** `vendor/dynamic-workflows-codex/src/appServerClient.js` (upstream `AppServerClient`, an EventEmitter over `codex app-server` JSON-RPC) and `codexSession.js` (sessionful thread/turn driver) are used as-is. Our `runner/fleet-runner.js` imports them. The API our adapter relies on is upstream's; the contract below documents what WE call into, for the adapter author — it is a description of vendored behavior, not a reimplementation target:
+1. **App-server client — VENDORED, not built:** in v0.2, `runner/fleet-runner.mjs` imported and wired only `vendor/dynamic-workflows-codex/src/appServerClient.js` (upstream `AppServerClient`, an EventEmitter over `codex app-server` JSON-RPC). `codexSession.js` was vendored but not imported or used by v0.2. As of v0.3, the app-server transport adopts the vendored `codexSession.js` as the sessionful thread/turn driver. The API our adapter relies on is upstream's; the contract below documents what WE call into, for the adapter author — it is a description of vendored behavior, not a reimplementation target:
    - `createClient({codexExe, logPath}) -> client` — spawns `codexExe app-server`, wires ndjson framing, logs every wire message to logPath when set.
    - `client.initialize({name, version}) -> Promise<result>`
    - `client.threadStart({cwd, sandbox, model, ephemeral}) -> Promise<{threadId}>`
@@ -246,7 +246,7 @@ The v1 driver prompt is pervasively PowerShell (~10 backslash-joined paths, `New
    - Server-initiated requests (approvals) are answered with a safe default decline and logged (fleet threads run sandboxed and should never need approvals).
 2. **`runner/fleet-runner.js`** — CLI: `node fleet-runner.js --batch <batch.json>`. Batch: `{repo, tasks:[{id,spec,verify?,allowUnverified?}], verify, model, effort, codexExe, wtBase?, transcriptDir?, maxParallel?, timeoutMinutes?}`. Executes the ENTIRE dispatch phase deterministically per task: id validation (same regex/dup/collision rules as the engine, collision = task error not delete) → worktree add `codex/<id>` → thread/start (cwd=worktree, sandbox `workspace-write`) → turn/start (composed prompt = spec + the v1 appended constraints) → events streamed to `<id>.codex-events.jsonl` beside the worktree → `waitForTurnEnd` (default timeout 15 min — no shell ceiling) → run verify via child_process in the worktree (absent verify → mark `unverified`) → red: ONE `turn/steer` correction with the failure tail, re-verify → artifact purge (`__pycache__`-class dirs) → `git add -A` + commit + `show --stat` audit (strip strays, amend) → transcript markdown (PROMPT/TIMELINE/FINAL MESSAGE/USAGE, from events) → per-task result in the v1 driver-report schema. Tasks run concurrently up to `maxParallel` (default 4). Output: `results.json` `{results:[...], approvedBranches:[], worktreeBase}` where approvedBranches is left EMPTY (review happens after; the field exists for shape compatibility) + exit 0 even with failed tasks (failures are data). Journaling: append-only `runner-journal.jsonl` for resume diagnostics. No `Date.now` restrictions here (plain Node, not a workflow script).
 3. **`viewer/fleet-viewer.html`** — fully self-contained static HTML (inline CSS/JS, zero external requests): drag-drop or file-pick `results.json` / `fleet-log.jsonl` / transcript `.md` files; renders run overview cards (task, status, verdict, tokens, duration) and a per-task timeline pane from transcripts. Dark theme, compact.
-4. **Integration:** dispatch skill v2 — backend order: (1) runner (`config.backend === 'app-server'` and node present): ONE shell command executes the whole dispatch phase, then Claude spawns reviewer agents per branch and proceeds with verdict-state + integration ladder unchanged; (2) engine workflow (Workflow tool present); (3) prose Agent-tool orchestration. Setup v2: detect node ≥18 (`node --version`), set `backend` (`app-server` default when available, else `exec`) + `nodeExe` in config.json. README: v0.2 features, Node requirement (optional but recommended), runner CLI usage standalone. plugin.json `0.2.0`.
+4. **Historical v0.2 integration (superseded by A9):** dispatch originally ordered the runner, Workflow engine, and prose Agent-tool orchestration as parallel backends. In v0.3 the runner is the single normative Codex lifecycle, the former engine is retained at `docs/reference/v2-workflow-engine.js` as reference-only, and Agent-tool prose remains only for no-Node stock installs and Claude-only mode.
 
 **Review/verdict/integration layers are UNCHANGED** — reviewers still independently re-run verifies; approved.json, guard, and the stage ladder are untouched by A8.
 
@@ -259,7 +259,7 @@ The v1 driver prompt is pervasively PowerShell (~10 backslash-joined paths, `New
 Two independent improvement passes (GPT-5.6-Sol read-only; Fable full-context) converged: the dual engine is the core debt, vendor usage is thinner than documented, and the runner has real correctness gaps. This amendment supersedes A8's parallel-engine framing.
 
 ### Architecture decision (both models, independently)
-- **Runner-first, ONE code lifecycle.** The pipeline (worktree → turn(s) → quiescence → verify → one correction → checked commit → transcript) lives ONCE in `runner/task-runner.mjs`. Only "run a Codex turn" varies, behind a transport interface. `workflows/codex-fleet.js` is DEMOTED to `docs/reference/` (no longer a normative backend); the Agent-tool prose fallback in dispatch remains for no-Node stock installs and Claude-only mode.
+- **Runner-first, ONE code lifecycle.** The pipeline (worktree → turn(s) → quiescence → verify → one correction → checked commit → transcript) lives ONCE in `runner/task-runner.mjs`. Only "run a Codex turn" varies, behind a transport interface. The former Workflow engine is retained at `docs/reference/v2-workflow-engine.js` as a historical, non-normative reference; the Agent-tool prose fallback in dispatch remains for no-Node stock installs and Claude-only mode.
 - **Adopt the vendored `codexSession.js`** for the app-server transport (retries, real interrupted-vs-failed outcome, token metering) instead of the hand-rolled turn loop. Correct the A8/NOTICE claim accordingly.
 
 ### Frozen module contracts (workers code against these; parallel-safe)

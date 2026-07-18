@@ -27,53 +27,42 @@ Inspect the actual repository before drafting any task. Every spec must:
 
 ## Choose the dispatch backend
 
-Select the highest available backend; all three converge on the SAME review + verdict-state + integration steps below.
+Use the runner-first lifecycle for Codex mode, then converge on the SAME review + verdict-state + integration steps below.
 
-1. **App-server runner (v0.2, preferred when `config.backend === 'app-server'` and node is available).** Write a batch file to a temp path — `{repo, codexExe, model, effort, tasks, verify, timeoutMinutes}` — then run the whole dispatch phase in ONE command:
+1. **Runner (normative for Codex mode when Node is available).** Use the runner only when `mode === 'codex'`, `codexExe` is an absolute existing file, and `nodeExe` is an absolute existing file. Select its `app-server` transport only when all of those conditions hold **and** setup recorded a current, compatible app-server probe (`config.backend === 'app-server'`); otherwise select the runner's `exec` transport. If the recorded probe is absent, failed, or stale for the current Codex/Node version, re-run setup before considering app-server compatible. Write a batch file to a temp path — `{repo, codexExe, backend, model, effort, tasks, verify, timeoutMinutes}` — then run the whole dispatch phase in ONE command. Invoke the absolute `nodeExe` from config, never bare `node`:
 
+   ```text
+   "<absolute nodeExe>" "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
    ```
-   node "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
+
+   After the runner exits, delete the temporary batch file in a `finally` cleanup (the runner has already read it); remove it on both success and failure. Read the runner's `results.json` payload, then normalize every flat driver result **before spawning any reviewer** with this exact conversion:
+
+   ```javascript
+   const results = runnerPayload.results.map(({ taskId, ...driver }) => ({
+     taskId,
+     driver,
+     review: null
+   }));
    ```
 
-   Read `<repo>/.codex-fleet/results.json` (`{results, approvedBranches:[], worktreeBase}`). This backend uses the vendored `codex app-server` transport for sessionful workers (no `codex exec` stdin hang, no shell-timeout ceiling; corrections are follow-up turns on the same warm thread). It performs ONLY the dispatch phase — you then spawn reviewer agents per branch (below) exactly as with the other backends.
-2. **Workflow engine** (when the Workflow tool is available): the `Workflow({scriptPath, args})` call below.
-3. **Agent-tool orchestration** (stock installs with neither): the prose fallback further down.
+   This moves every runner field other than `taskId` under `driver` without renaming or dropping fields. Spawn one reviewer for each reviewable normalized entry, then replace that entry's `review: null` with the reviewer's structured result. Recompute `approvedBranches` from the completed canonical entries; do not trust the runner's initially empty `approvedBranches`. App-server uses the vendored sessionful transport; `exec` uses the same lifecycle with a different turn transport.
+2. **Agent-tool orchestration** is the fallback for stock installs without a usable absolute `nodeExe` and for `mode === 'claude'`: use the prose procedure further down.
 
-## Invoke the workflow
+## Historical workflow-engine reference
 
-Use the Workflow tool, never a raw shell replacement:
+`docs/reference/v2-workflow-engine.js` preserves the former v2 Workflow-tool implementation for historical comparison only. Do not invoke it, select it as a backend, or treat it as the normative pipeline contract; the runner-first lifecycle above is the single Codex code path.
 
-```javascript
-Workflow({
-  scriptPath: '${CLAUDE_PLUGIN_ROOT}/workflows/codex-fleet.js',
-  args: {
-    repo,
-    mode,
-    codexExe,
-    platform,
-    model,
-    effort,
-    verify,
-    tasks,
-    agentTypes: {
-      driver: 'codex-fleet:codex-driver',
-      reviewer: 'codex-fleet:fleet-reviewer'
-    }
-  }
-})
-```
+The canonical result remains `{results: [{taskId, driver, review}], approvedBranches, worktreeBase}`. Trust the adversarial review verdict over the driver's self-assessment. An `approve` verdict is valid only after the reviewer independently re-runs the task's verify command and gets green. Tasks with no verify command produce `unverified` branches, which never enter `approvedBranches` unless the task sets `allowUnverified: true`.
 
-Expect `{results: [{taskId, driver, review}], approvedBranches, worktreeBase}`. Trust the adversarial review verdict over the driver's self-assessment. An `approve` verdict is valid only after the reviewer independently re-runs the task's verify command and gets green. Tasks with no verify command produce `unverified` branches, which never enter `approvedBranches` unless the task sets `allowUnverified: true`.
+## Runtime fallback — no-Node and Claude-only installations
 
-## Runtime fallback — stock installations without the Workflow tool
-
-The Workflow tool is not part of the documented stock Claude Code tool surface. If it is unavailable, DO NOT abandon the run and DO NOT fall back to bare shell calls. Orchestrate the identical pipeline with parallel Agent-tool subagents:
+When the runner cannot be used because no valid absolute `nodeExe` is available, or when `mode === 'claude'`, do not abandon the run and do not fall back to bare shell calls. Orchestrate the identical pipeline with parallel Agent-tool subagents:
 
 1. For each task, spawn one driver subagent (agentType `codex-fleet:codex-driver`; on resolution failure, a general-purpose agent with the same prompt). Its prompt carries the full driver lifecycle: isolated worktree on `codex/<id>` (existing branch = error, never silent delete), foreground Codex dispatch with `--json`, closed stdin, model/effort pinned, 10-minute window + one resume continuation, verify, one correction round, artifact purge, commit, audit, structured report.
 2. As each driver finishes, spawn its reviewer subagent (agentType `codex-fleet:fleet-reviewer`) with the adversarial review duties including the mandatory independent verify re-run.
 3. Assemble `{results, approvedBranches, worktreeBase}` yourself applying the same approval rule (approve verdict + green verify; unverified excluded unless opted in).
 
-The bundled `workflows/codex-fleet.js` remains the canonical statement of the pipeline contract — read it when in doubt about any step. Both paths MUST produce the same branch layout, verdict semantics, and report shape.
+The runner-first lifecycle is the canonical pipeline contract. The Agent-tool fallback MUST produce the same branch layout, verdict semantics, and report shape; `docs/reference/v2-workflow-engine.js` is reference-only.
 
 ## Enforce worker observability
 
