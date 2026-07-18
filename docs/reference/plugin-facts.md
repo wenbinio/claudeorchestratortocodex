@@ -4,15 +4,15 @@ Researched against official docs 2026-07-18. Workers: treat this as authoritativ
 
 ## plugin.json (`.claude-plugin/plugin.json`)
 
-Required: `name` (kebab-case; becomes the skill namespace prefix `/name:skill`), `description`.
-Optional: `version` (set it — we version-pin releases), `author`.
+Required: `name` only (kebab-case; becomes the skill namespace prefix `/name:skill`).
+Recommended: `description` (discovery), `version` (set it — we version-pin releases), `author`.
 Do NOT add a `userConfig` block — this plugin keeps machine config solely in the data-dir `config.json` written by the setup skill.
 
 ## marketplace.json (`.claude-plugin/marketplace.json`)
 
 ```json
 {
-  "name": "<marketplace-name>",
+  "name": "wenbinio",
   "owner": { "name": "wenbinio" },
   "plugins": [
     {
@@ -28,10 +28,10 @@ Do NOT add a `userConfig` block — this plugin keeps machine config solely in t
 
 ```
 /plugin marketplace add wenbinio/claudeorchestratortocodex
-/plugin install codex-fleet@<marketplace-name>
+/plugin install codex-fleet@wenbinio
 ```
 
-Updates: `/plugin marketplace update <marketplace-name>`. Version bumps in plugin.json gate update visibility.
+Updates: `/plugin marketplace update wenbinio`. Version bumps in plugin.json gate update visibility.
 
 ## Path variables
 
@@ -45,6 +45,8 @@ Updates: `/plugin marketplace update <marketplace-name>`. Version bumps in plugi
 `agents/<name>.md` (subagent definitions; markdown frontmatter `name`, `description`, optional `tools`, body = system prompt)
 `hooks/hooks.json` (hook registrations; `${CLAUDE_PLUGIN_ROOT}` allowed in commands)
 Any other dirs (workflows/, scripts/, docs/) ride along and are reachable via `${CLAUDE_PLUGIN_ROOT}`.
+
+CAVEAT (spec A7.1): a bundled `workflows/*.js` script is readable but there is NO documented stock tool that executes it — the `Workflow` tool is not part of the documented Claude Code tool surface. The dispatch skill must carry a full Agent-tool orchestration fallback; the engine script is an accelerator on installations where a workflow runtime exists.
 
 ## Cloud sandbox constraints (README material)
 
@@ -61,5 +63,5 @@ Any other dirs (workflows/, scripts/, docs/) ride along and are reachable via `$
 }
 ```
 
-- Skills and agents load in cloud sandboxes. Hooks, monitors, and LSP servers do NOT run there.
+- Skills and agents load in cloud sandboxes. Hooks (repo-level AND plugin) DO run in cloud sessions with `CLAUDE_CODE_REMOTE=true` set — an earlier version of this file claimed hooks were local-only; that was stale research, corrected per spec A7.11. Monitors and LSP servers remain CLI-only.
 - Codex CLI in a sandbox: `npm i -g @openai/codex`, auth via `OPENAI_API_KEY` env secret (interactive ChatGPT OAuth is impossible headless). No key → the plugin's Claude-only fallback mode.
