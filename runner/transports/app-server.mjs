@@ -277,7 +277,11 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
     await driver.cleanup().catch(() => {});
     if (clientRetained) {
       clientRetained = false;
-      await releaseClient(driver.client, true);
+      // Ref-counted release only: the app-server client is a process-wide
+      // singleton (vendored getClient). A timed-out/broken worker must release
+      // its own reference — NEVER force-shutdown, which would tear down the
+      // shared client and fail every other concurrent worker in the pool.
+      await releaseClient(driver.client);
     }
   }
 
