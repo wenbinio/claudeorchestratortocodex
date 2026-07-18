@@ -40,6 +40,19 @@ const repo = String(cfg.repo)
 const repoBase = repo.replace(/[\\/]+$/, '')
 const defaultVerify = cfg.verify || ''
 const codexExe = mode === 'codex' ? cfg.codexExe : ''
+const codexModel = cfg.model || 'gpt-5.6-sol'
+const codexEffort = cfg.effort || 'xhigh'
+
+// A7.13 — validate task ids before any dispatch: safe charset, bounded length, no duplicates.
+const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/
+const seenIds = new Set()
+for (const t of cfg.tasks) {
+  if (!t || typeof t.id !== 'string' || !TASK_ID_RE.test(t.id)) {
+    throw new Error('codex-fleet: invalid task id ' + JSON.stringify(t && t.id) + ' — must match ' + TASK_ID_RE)
+  }
+  if (seenIds.has(t.id)) throw new Error('codex-fleet: duplicate task id "' + t.id + '" in one batch')
+  seenIds.add(t.id)
+}
 const pathSeparator = platform === 'windows' ? '\\' : '/'
 const wtBase = repoBase + '-codex-wt'
 const transcriptBase = cfg.transcriptDir
@@ -77,6 +90,7 @@ const DRIVER_SCHEMA = {
     branch: { type: 'string', description: 'codex/<taskId>, or "" only when blocked before branching' },
     worktree: { type: 'string' },
     verifyPassed: { type: 'boolean' },
+    unverified: { type: 'boolean', default: false, description: 'true when no verify command was configured for this task' },
     correctionRoundUsed: { type: 'boolean' },
     filesChanged: { type: 'array', items: { type: 'string' } },
     diffStat: { type: 'string' },
@@ -127,25 +141,26 @@ function windowsCommandBlock(task, paths) {
   let codexCommands = ''
   if (mode === 'codex') {
     const qCodex = powerShellQuote(codexExe)
+    const modelArgs = `-m ${powerShellQuote(codexModel)} -c ${powerShellQuote('model_reasoning_effort=' + codexEffort)}`
     codexCommands = `
-CODEX INITIAL EXECUTION (the event file was cleared during preparation):
+CODEX INITIAL EXECUTION (the event file was cleared during preparation). NOTE: the here-string closer '@ MUST be at column 0 — indenting it is a PowerShell parse error:
   $codexPrompt = @'
-  <the exact prompt described in the implementation step>
-  '@
-  $null | & ${qCodex} exec --json $codexPrompt -C ${qWorktree} -s workspace-write -o ${qCapture} | Tee-Object -FilePath ${qEvents}
+<the exact prompt described in the implementation step>
+'@
+  $null | & ${qCodex} exec --json $codexPrompt ${modelArgs} -C ${qWorktree} -s workspace-write -o ${qCapture} | Tee-Object -FilePath ${qEvents}
 
-CODEX CORRECTION EXECUTION (a new session; append its events):
+CODEX CORRECTION EXECUTION (a new session; append its events; same column-0 '@ rule):
   $correctionPrompt = @'
-  <the exact correction prompt described in the correction step>
-  '@
-  $null | & ${qCodex} exec --json $correctionPrompt -C ${qWorktree} -s workspace-write -o ${qCapture} | Tee-Object -FilePath ${qEvents} -Append
+<the exact correction prompt described in the correction step>
+'@
+  $null | & ${qCodex} exec --json $correctionPrompt ${modelArgs} -C ${qWorktree} -s workspace-write -o ${qCapture} | Tee-Object -FilePath ${qEvents} -Append
 
 CODEX TIMEOUT CONTINUATION (append to the same event file):
   $null | & ${qCodex} exec resume $sessionId 'continue' --json -o ${qCapture} | Tee-Object -FilePath ${qEvents} -Append
 
-Every Codex command above is a FOREGROUND shell-tool call with timeout: ${CODEX_TOOL_TIMEOUT_MS}. Never set run_in_background and never launch Codex via Start-Process. If a call times out, kill only the Codex process belonging to this task before resuming. Use its process id when available:
-  Stop-Process -Id <timed-out-codex-pid> -Force
-If a pid is not reported, locate the process by BOTH the Codex executable and this exact worktree/session command line before Stop-Process; never kill sibling fleet workers.
+Every Codex command above is a FOREGROUND shell-tool call with timeout: ${CODEX_TOOL_TIMEOUT_MS}. Never set run_in_background and never launch Codex via Start-Process. If a call times out, kill the ENTIRE process tree of the Codex process belonging to this task before resuming (Codex spawns helper children):
+  taskkill /PID <timed-out-codex-pid> /T /F
+Then confirm death (Get-Process -Id <pid> must error) before opening the resume window. If a pid is not reported, locate the process by BOTH the Codex executable and this exact worktree/session command line before killing; never kill sibling fleet workers.
 
 TRANSCRIPT WRITE (outside the worktree unless the caller explicitly configured another directory):
   [System.IO.File]::WriteAllText(${qTranscript}, $transcriptMarkdown, [System.Text.UTF8Encoding]::new($false))`
@@ -159,10 +174,10 @@ PREFLIGHT AND DIRECTORIES:
   New-Item -ItemType Directory -Force -Path ${qWtBase} | Out-Null
   New-Item -ItemType Directory -Force -Path ${qTranscriptBase} | Out-Null
 
-REMOVE A STALE TASK WORKTREE/BRANCH, IF PRESENT:
-  & git -C ${qRepo} worktree remove --force ${qWorktree} 2>$null
+BRANCH-COLLISION CHECK (an existing codex/<id> branch is an ERROR, never a silent delete — it may hold unmerged prior work):
   & git -C ${qRepo} show-ref --verify --quiet ('refs/heads/' + ${qBranch})
-  if ($LASTEXITCODE -eq 0) { & git -C ${qRepo} branch -D ${qBranch} }
+  if ($LASTEXITCODE -eq 0) { <report status "blocked": branch collision — the caller must delete or integrate it explicitly, or choose a new task id> }
+  & git -C ${qRepo} worktree prune
 
 CREATE THE WORKTREE, RETRYING LOCK ERRORS AT MOST THREE TIMES:
   for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -208,32 +223,33 @@ function posixCommandBlock(task, paths) {
   let codexCommands = ''
   if (mode === 'codex') {
     const qCodex = posixQuote(codexExe)
+    const modelArgs = `-m ${posixQuote(codexModel)} -c ${posixQuote('model_reasoning_effort=' + codexEffort)}`
     codexCommands = `
-CODEX INITIAL EXECUTION (the event file was cleared during preparation):
+CODEX INITIAL EXECUTION (the event file was cleared during preparation). NOTE: the heredoc terminator MUST be at column 0 — indenting it means the heredoc never terminates:
   codex_prompt=$(cat <<'CODEX_FLEET_PROMPT'
-  <the exact prompt described in the implementation step>
-  CODEX_FLEET_PROMPT
+<the exact prompt described in the implementation step>
+CODEX_FLEET_PROMPT
   )
   set -o pipefail
-  ${qCodex} exec --json "$codex_prompt" -C ${qWorktree} -s workspace-write -o ${qCapture} < /dev/null | tee ${qEvents}
+  ${qCodex} exec --json "$codex_prompt" ${modelArgs} -C ${qWorktree} -s workspace-write -o ${qCapture} < /dev/null | tee ${qEvents}
 
-CODEX CORRECTION EXECUTION (a new session; append its events):
+CODEX CORRECTION EXECUTION (a new session; append its events; same column-0 terminator rule):
   correction_prompt=$(cat <<'CODEX_FLEET_CORRECTION'
-  <the exact correction prompt described in the correction step>
-  CODEX_FLEET_CORRECTION
+<the exact correction prompt described in the correction step>
+CODEX_FLEET_CORRECTION
   )
-  ${qCodex} exec --json "$correction_prompt" -C ${qWorktree} -s workspace-write -o ${qCapture} < /dev/null | tee -a ${qEvents}
+  ${qCodex} exec --json "$correction_prompt" ${modelArgs} -C ${qWorktree} -s workspace-write -o ${qCapture} < /dev/null | tee -a ${qEvents}
 
 CODEX TIMEOUT CONTINUATION (append to the same event file):
   ${qCodex} exec resume "$session_id" 'continue' --json -o ${qCapture} < /dev/null | tee -a ${qEvents}
 
-Every Codex command above is a FOREGROUND shell-tool call with timeout: ${CODEX_TOOL_TIMEOUT_MS}. Never set run_in_background and never append '&'. If a call times out, kill only the Codex process belonging to this task before resuming. Use its process id when available:
-  kill -TERM <timed-out-codex-pid>
-  kill -KILL <timed-out-codex-pid>  # only if it survives TERM
-If a pid is not reported, locate the process by BOTH the Codex executable and this exact worktree/session command line; never use a broad pkill that could kill sibling fleet workers.
+Every Codex command above is a FOREGROUND shell-tool call with timeout: ${CODEX_TOOL_TIMEOUT_MS}. Never set run_in_background and never append '&'. If a call times out, kill the ENTIRE process tree of the Codex process belonging to this task before resuming (Codex spawns helper children). Kill the process group when possible, else the pid plus its children:
+  kill -TERM -- -<process-group-id>   # preferred
+  kill -KILL -- -<process-group-id>   # only if it survives TERM
+Then confirm death (kill -0 <pid> must fail) before opening the resume window. If a pid is not reported, locate the process by BOTH the Codex executable and this exact worktree/session command line; never use a broad pkill that could kill sibling fleet workers.
 
 TRANSCRIPT WRITE (outside the worktree unless the caller explicitly configured another directory):
-  printf '%s\n' "$transcript_markdown" > ${qTranscript}`
+  printf '%s\\n' "$transcript_markdown" > ${qTranscript}`
   }
 
   return `POSIX / SHELL COMMAND BLOCK
@@ -244,9 +260,9 @@ PREFLIGHT AND DIRECTORIES:
   mkdir -p -- ${qWtBase}
   mkdir -p -- ${qTranscriptBase}
 
-REMOVE A STALE TASK WORKTREE/BRANCH, IF PRESENT:
-  git -C ${qRepo} worktree remove --force ${qWorktree} 2>/dev/null || true
-  if git -C ${qRepo} show-ref --verify --quiet ${qBranchRef}; then git -C ${qRepo} branch -D ${qBranch}; fi
+BRANCH-COLLISION CHECK (an existing codex/<id> branch is an ERROR, never a silent delete — it may hold unmerged prior work):
+  if git -C ${qRepo} show-ref --verify --quiet ${qBranchRef}; then <report status "blocked": branch collision — the caller must delete or integrate it explicitly, or choose a new task id>; fi
+  git -C ${qRepo} worktree prune
 
 CREATE THE WORKTREE, RETRYING LOCK ERRORS AT MOST THREE TIMES:
   attempt=1
@@ -284,7 +300,7 @@ Build the Codex prompt from the TASK SPEC verbatim and append exactly these cons
 
 Run CODEX INITIAL EXECUTION from the platform block. It MUST include --json, tee stdout as JSONL to ${paths.events}, write the final-message capture with -o to ${paths.capture}, close stdin with the platform's shown idiom, and stay in the foreground with shell-tool timeout ${CODEX_TOOL_TIMEOUT_MS}. The -o and JSONL files are beside the worktree, never inside it. run_in_background is explicitly forbidden.
 
-TIMEOUT POLICY FOR EVERY CODEX EXEC INVOCATION: if the foreground tool reaches ${CODEX_TOOL_TIMEOUT_MS} ms, kill its process first. Read sessionId from the JSONL events file (normally the early session/thread-start event; accept the actual session_id, sessionId, thread_id, or equivalent field emitted by Codex). Then run exactly ONE CODEX TIMEOUT CONTINUATION window using "codex exec resume <sessionId> 'continue'", also foreground with timeout ${CODEX_TOOL_TIMEOUT_MS}, --json, closed stdin, and events appended. If the session id cannot be recovered, resume fails, or that second window times out, stop dispatching and report status "failed" with explicit guidance to decompose this task into smaller tasks. Never open a third window.
+TIMEOUT POLICY FOR EVERY CODEX EXEC INVOCATION: if the foreground tool reaches ${CODEX_TOOL_TIMEOUT_MS} ms, kill its process tree first (platform block shows how) and confirm death. Read sessionId from the JSONL events file — use the MOST RECENT session/thread-start event in the file, not the first (correction runs append a NEW session to the same file, and resuming the wrong session replays stale work; accept the actual session_id, sessionId, thread_id, or equivalent field emitted by Codex). Then run exactly ONE CODEX TIMEOUT CONTINUATION window using "codex exec resume <sessionId> 'continue'", also foreground with timeout ${CODEX_TOOL_TIMEOUT_MS}, --json, closed stdin, and events appended. If the session id cannot be recovered, resume fails, or that second window times out, stop dispatching and report status "failed" with explicit guidance to decompose this task into smaller tasks. Never open a third window.
 
 After Codex finishes, read ${paths.capture}. If it is absent, treat the dispatch as failed and preserve the best command-output tail in the summary.`
 }
@@ -315,7 +331,7 @@ function driverPrompt(task) {
     : claudeCorrectionBlock()
   const verifyStep = verify
     ? `5. VERIFY. From inside the worktree, run this exact command yourself and capture its exit status and output:\n---\n${verify}\n---\nSet verifyPassed true only on exit code 0.`
-    : '5. VERIFY. No verify command is configured. Skip execution, set verifyPassed true, and explicitly note the skip in summary.'
+    : '5. VERIFY. No verify command is configured. Skip execution, set verifyPassed false AND unverified true, and explicitly note in summary that this branch is UNVERIFIED. Status may still be "done" if implementation completed; unverified branches are excluded from auto-integration by policy.'
   const observability = mode === 'codex'
     ? `
 8. DISTILL CODEX OBSERVABILITY even when implementation or verification failed. Parse every valid JSON line in ${paths.events}; tolerate partial/malformed final lines and use best-available data. Write ${paths.transcript} as Markdown with exactly these top-level sections:
@@ -324,7 +340,8 @@ function driverPrompt(task) {
    # FINAL MESSAGE — the final captured Codex message, trimmed only in StructuredOutput, not in the transcript.
    # USAGE — input/output/total tokens when emitted, duration when derivable, and sessionId.
 Populate codexCommandsRun from command events, filesPatched as unique event-reported paths, sessionId from the event stream, and transcriptPath=${paths.transcript}. Use defaults 0, [], and "" when an event field is unavailable; never fabricate telemetry. If transcript writing itself fails, keep transcriptPath empty and report the failure in summary.`
-    : ''
+    : `
+8. OBSERVABILITY: not applicable in claude mode — leave the Codex-specific StructuredOutput fields at their schema defaults and continue to the report step.`
 
   return `You are a ${mode === 'codex' ? 'Codex worker' : 'Claude fallback'} DRIVER for one fleet task. Follow the shared lifecycle below and use only the platform command block supplied here.
 
@@ -369,7 +386,7 @@ function reviewPrompt(task, driver) {
   const verify = task.verify || defaultVerify
   const independentVerify = verify
     ? `You MUST independently run this exact verification command yourself from the worktree, even if the driver says it passed:\n---\n${verify}\n---\nCapture the exit status and a useful output tail. The driver's run does not count. verdict "approve" is forbidden unless your own run is green.`
-    : 'No task verification command was configured. Because you cannot establish your own green run, verdict "approve" is forbidden; use "needs_work" or "reject" and explain this verification gap.'
+    : 'No task verification command was configured, so no green run exists on either side. You MAY still verdict "approve" on inspection alone when the diff fully satisfies the spec with no blocker/major issues — but you MUST state "UNVERIFIED — approved on inspection only" in notes. Policy elsewhere excludes unverified branches from auto-integration, so your approve does not integrate untested work.'
 
   return `Adversarial code review of a fleet-authored change. You have read-only intent: do not edit project source, commits, branches, or worktree state. Your final action must be StructuredOutput only.
 
@@ -407,33 +424,51 @@ function agentOptions(role, task) {
   return options
 }
 
+// A7.6 — a failed spawn with a scoped agentType must not kill the task: retry once without it.
+function spawnAgent(prompt, options) {
+  if (options.agentType === undefined) return agent(prompt, options)
+  return Promise.resolve()
+    .then(() => agent(prompt, options))
+    .catch(() => {
+      const fallback = {}
+      for (const key in options) { if (key !== 'agentType') fallback[key] = options[key] }
+      log(`codex-fleet: agentType "${options.agentType}" failed to resolve — retrying with the default agent`)
+      return agent(prompt, fallback)
+    })
+}
+
 phase('Dispatch')
 log(`codex-fleet: ${cfg.tasks.length} task(s), mode=${mode}, platform=${platform}, repo=${repo}`)
 
 const results = await pipeline(
   cfg.tasks,
-  task => agent(driverPrompt(task), agentOptions('driver', task)),
+  task => spawnAgent(driverPrompt(task), agentOptions('driver', task)),
   (driver, task) => {
     if (!driver) return { taskId: task.id, driver: null, review: null }
     if (driver.status === 'blocked' || !driver.branch) {
       return { taskId: task.id, driver, review: null }
     }
-    return agent(reviewPrompt(task, driver), agentOptions('reviewer', task))
+    return spawnAgent(reviewPrompt(task, driver), agentOptions('reviewer', task))
       .then(review => ({ taskId: task.id, driver, review }))
   }
 )
 
+const taskById = {}
+for (const t of cfg.tasks) taskById[t.id] = t
+
 const out = results.filter(Boolean)
+// A7.4 — unverified branches never auto-integrate unless the task explicitly opts in.
 const approved = out.filter(result => (
   result.driver &&
-  result.driver.verifyPassed &&
   result.review &&
-  result.review.verdict === 'approve'
+  result.review.verdict === 'approve' &&
+  (result.driver.verifyPassed ||
+    (result.driver.unverified && taskById[result.taskId] && taskById[result.taskId].allowUnverified === true))
 ))
 
 log(`codex-fleet done: ${approved.length}/${out.length} approved. Branches await the caller's selected integration flow; apply approved branches sequentially and run the full verification pipeline after each.`)
 
-export default {
+return {
   results: out,
   approvedBranches: approved.map(result => result.driver.branch),
   worktreeBase: wtBase,
