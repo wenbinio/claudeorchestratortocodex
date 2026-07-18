@@ -253,3 +253,42 @@ The v1 driver prompt is pervasively PowerShell (~10 backslash-joined paths, `New
 **Compatibility:** the `codex exec` path and the v0.1 engine remain fully supported (machines without Node). The runner is additive.
 
 **Credit:** README states plainly that the app-server transport + sessionful-worker layer is vendored from scasella/claude-dynamic-workflows-codex under MIT (© Stephen Casella), links the upstream repo, and points at `vendor/dynamic-workflows-codex/{LICENSE,NOTICE.md}`. Not framed as our own work.
+
+## A9. v0.3 — unify to one runner-first lifecycle + close verified defects
+
+Two independent improvement passes (GPT-5.6-Sol read-only; Fable full-context) converged: the dual engine is the core debt, vendor usage is thinner than documented, and the runner has real correctness gaps. This amendment supersedes A8's parallel-engine framing.
+
+### Architecture decision (both models, independently)
+- **Runner-first, ONE code lifecycle.** The pipeline (worktree → turn(s) → quiescence → verify → one correction → checked commit → transcript) lives ONCE in `runner/task-runner.mjs`. Only "run a Codex turn" varies, behind a transport interface. `workflows/codex-fleet.js` is DEMOTED to `docs/reference/` (no longer a normative backend); the Agent-tool prose fallback in dispatch remains for no-Node stock installs and Claude-only mode.
+- **Adopt the vendored `codexSession.js`** for the app-server transport (retries, real interrupted-vs-failed outcome, token metering) instead of the hand-rolled turn loop. Correct the A8/NOTICE claim accordingly.
+
+### Frozen module contracts (workers code against these; parallel-safe)
+- **Transport** (`runner/transports/{app-server,exec}.mjs`), each exports:
+  `async function createWorker({codexExe, cwd, model, effort, onEvent}) -> { async turn(prompt, {timeoutMs}) -> {status:'completed'|'failed'|'interrupted', finalMessage, commandsRun, filesPatched, tokenUsage, sessionId}, async close() }`. app-server wraps vendored `codexSession.js`; exec shells `codex exec` with the `$null|`/`</dev/null` idiom.
+- **Core** (`runner/task-runner.mjs`) exports:
+  `async function runTask({repo, baseSha, task, verify, transport, wtBase, transcriptDir, timeoutMs}) -> driverReport` (same driver-report schema as today plus `baseSha`, `commitSha`). Owns all deterministic steps; calls `transport.turn()` only for implementation + correction.
+- **CLI** (`runner/fleet-runner.mjs`) becomes a thin adapter: parse batch, resolve `baseSha` ONCE, select transport by `cfg.backend`, run the pool, write run-state EXTERNALLY.
+
+### Verified defects each task MUST fix (all confirmed against shipped code)
+1. **Turn quiescence (HIGH):** wait on the SPECIFIC `{threadId,turnId}` terminal event, honor `turn.status`, distinguish completed/failed/interrupted/timed_out. On timeout: interrupt, then wait a grace period for the terminal event, then kill the process tree — NEVER verify while the writer is live. Attach the listener BEFORE `turn/start` (fast-completion race).
+2. **Checked git (HIGH):** `mustGit()` with typed errors; snapshot `baseSha` once; all worktrees created at `baseSha`; require nonempty staged diff; require commit exit 0; assert `commitSha !== baseSha` and `commitSha^ === baseSha`; audit with explicit `commitSha`, never ambient HEAD/HEAD~1. One task's failure must not abort the pool.
+3. **Async subprocesses (HIGH):** replace `spawnSync` with async `spawn`/`execFile` (bounded output tails, explicit verify timeout, tree-kill) so a verifier can't stall other workers; serialize the short `git worktree add` critical section.
+4. **Run-state OUT of the repo (HIGH):** batch gains `runId` + `outDir`; results/journal/events/transcripts go under `${CLAUDE_PLUGIN_DATA}/runs/<runId>/` (or explicit external dir), atomic temp+rename. Fixes the self-contradiction where the preferred backend dirties the tree stage-mode requires clean.
+5. **Approvals denied (HIGH):** app-server transport passes `approvalPolicy:"never"` + an explicit request handler that rejects permission-escalation/dynamic-tool/unknown server requests; worktree/git restrictions go in `developerInstructions`, not just user text.
+6. **Real event parsing (HIGH):** delete the no-op `threadId` filter; switch on `commandExecution`/`fileChange`/`agentMessage`; record exit codes, file paths, `phase==='final_answer'`; idempotent collector shutdown that awaits stream `finish`; write a transcript on EVERY terminal path (failure/timeout/no-change).
+7. **Verifier-mutation isolation (HIGH):** snapshot the worker diff BEFORE verify; after verify, restore verifier-only mutations (a formatter/test that rewrites tracked files must not land in the commit); optional `allowedFiles`/`excludedFiles`.
+8. **Guard hardening (HIGH):** PowerShell AST on Windows, a real POSIX tokenizer on sh; recognize `git -C`/global opts/`refs/heads/…`; canonicalize repo identity from the merge command's target via `--git-common-dir`; keep "advisory tripwire" framing.
+9. **Atomic verdict store (HIGH):** `scripts/verdict-store` helper — lock, read-modify-write, fsync, atomic rename; store `reviewVerdict`+`driverVerifyPassed`+`reviewVerifyPassed`+`allowUnverified`+derived `eligible`; guard requires `eligible===true`.
+10. **Setup capability probe (MED):** `fleet-runner.mjs --probe` does initialize + model list + one ephemeral read-only turn; pick `exec` when the app-server probe fails; re-probe on version change.
+11. **Dispatch backend gating (MED):** select app-server ONLY when `mode==='codex'` AND `codexExe`+`nodeExe` exist AND probe compatible; invoke the ABSOLUTE `nodeExe`; specify the exact runner-result → `{taskId,driver,review}` normalization; delete the temp batch after read.
+12. **Portability (MED):** separate `Bash` and `PowerShell` hook matcher entries; declare/verify `jq` (or drop it); strict-POSIX or explicit `bash`; centralize data-dir resolution.
+
+### Doc corrections (verified falsehoods — fix regardless)
+- README "SHA mismatches fail open" is FALSE — guards block-on-stale (A7.8). Correct it.
+- A8 + `vendor/.../NOTICE.md` "codexSession.js used as-is" is FALSE at v0.2 — only `appServerClient.js` was imported. v0.3 makes it true (adopts codexSession); update both docs to describe reality at the shipped version.
+
+### Test harness (Fable's #2 — the unlock)
+`test/mock-app-server.mjs`: a fake `codex` that speaks the app-server handshake and replays `docs/reference/app-server/live-probe-transcript.jsonl`. `test/runner.test.mjs` drives `fleet-runner.mjs` against it in a throwaway git fixture asserting worktree layout, verify/correction, strip-strays, checked-commit, transcript shape, results schema, blocked/collision paths. Guard matrix scripted (A3/A7.8). `package.json` `npm test` runs it; `.github/workflows/ci.yml` on ubuntu+windows. Also gives the self-hosting repo its missing verify command (unhobbles stage-mode on its own dogfood).
+
+### Out of scope for v0.3 (deferred, logged)
+Reviewer-steer round (Fable #4), crash `--resume` (Fable #3), live supervision dashboard (Fable #5), commit provenance trailers (Fable #7) — all valuable, all sit cleanly on the unified core once it exists. `plugin.json` → `0.3.0`.
