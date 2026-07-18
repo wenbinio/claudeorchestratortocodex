@@ -79,20 +79,15 @@ function assertFrozenReport(report) {
   assert.deepEqual(Object.keys(report).sort(), DRIVER_REPORT_KEYS);
 }
 
-async function configureMockExecutable(t, repo) {
-  if (process.platform !== "win32") {
-    const originalMode = (await stat(MOCK_APP_SERVER)).mode & 0o777;
-    await chmod(MOCK_APP_SERVER, 0o755);
-    t.after(() => chmod(MOCK_APP_SERVER, originalMode).catch(() => {}));
-    return MOCK_APP_SERVER;
-  }
-
-  // Native Windows spawn cannot execute a shebang .mjs directly. Node itself
-  // is the executable and its mandatory `app-server` argv names this tiny
-  // fixture-local trampoline, which imports the same mock module.
-  const launcher = `import(${JSON.stringify(pathToFileURL(MOCK_APP_SERVER).href)});\n`;
-  await writeFile(path.join(repo, "app-server"), launcher, "utf8");
-  return process.execPath;
+function configureMockExecutable() {
+  // Cross-platform: codexExe is node itself, and the transport's codexArgs
+  // injection seam names the mock module as the script plus the app-server argv.
+  // This avoids shebang/.cmd spawn limits and the worktree-vs-repo cwd trap of a
+  // launcher file (an untracked repo file is absent from the clean worktree).
+  return {
+    codexExe: process.execPath,
+    codexArgs: [MOCK_APP_SERVER, "app-server", "--listen", "stdio://"],
+  };
 }
 
 test("fleet runner is hermetic, externalizes state, commits, and blocks collisions", { timeout: 90_000 }, async (t) => {
@@ -119,7 +114,7 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
     "utf8",
   );
 
-  const codexExe = await configureMockExecutable(t, repo);
+  const { codexExe, codexArgs } = configureMockExecutable();
   await git(repo, "init");
   await git(repo, "config", "user.name", "Codex Fleet Test");
   await git(repo, "config", "user.email", "codex-fleet-test@example.invalid");
@@ -129,10 +124,16 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
   await git(repo, "branch", "codex/collision", baseSha);
 
   const batchPath = path.join(tempRoot, "batch.json");
-  const verify = `${JSON.stringify(process.execPath)} --test fixture.test.mjs`;
+  // PowerShell needs the call operator `&` before a quoted executable path;
+  // POSIX `sh -c` must NOT have it (`&` would background the command).
+  const nodeQuoted = JSON.stringify(process.execPath);
+  const verify = process.platform === "win32"
+    ? `& ${nodeQuoted} --test fixture.test.mjs`
+    : `${nodeQuoted} --test fixture.test.mjs`;
   await writeFile(batchPath, JSON.stringify({
     repo: await realpath(repo),
     codexExe,
+    codexArgs,
     backend: "app-server",
     runId: "runner-test",
     outDir,
@@ -170,7 +171,7 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
   assert.equal(await exists(path.join(repo, ".codex-fleet", "results.json")), false);
 
   const payload = JSON.parse(await readFile(resultsPath, "utf8"));
-  assert.deepEqual(Object.keys(payload).sort(), ["approvedBranches", "results", "worktreeBase"]);
+  assert.deepEqual(Object.keys(payload).sort(), ["approvedBranches", "outDir", "results", "runId", "worktreeBase"]);
   assert.deepEqual(payload.approvedBranches, []);
   assert.equal(path.resolve(payload.worktreeBase), path.resolve(wtBase));
   assert.equal(payload.results.length, 2);

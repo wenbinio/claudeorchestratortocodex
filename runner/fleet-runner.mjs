@@ -274,7 +274,7 @@ async function runBatch(args) {
   const outDir = path.resolve(cfg.outDir || path.join(dataDir, "runs", runId));
   await assertExternalRunDirectory(repo, outDir);
 
-  const worktreeBase = path.join(outDir, "worktrees");
+  const worktreeBase = cfg.wtBase ? path.resolve(cfg.wtBase) : path.join(outDir, "worktrees");
   const transcriptDir = path.join(outDir, "transcripts");
   const eventsDir = path.join(outDir, "events");
   await Promise.all([
@@ -305,6 +305,7 @@ async function runBatch(args) {
     try {
       worker = await transportModule.createWorker({
         codexExe: cfg.codexExe,
+        codexArgs: cfg.codexArgs,
         cwd: worktree,
         model: cfg.model,
         effort: cfg.effort,

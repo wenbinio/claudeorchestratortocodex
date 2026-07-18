@@ -233,7 +233,7 @@ function denyServerRequest(request) {
   throw new Error(`Rejected unsupported app-server request: ${method || "(missing method)"}`);
 }
 
-export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {}) {
+export async function createWorker({ codexExe, codexArgs, cwd, model, effort, onEvent } = {}) {
   if (!cwd) throw new TypeError("createWorker requires cwd");
 
   let driver = null;
@@ -257,6 +257,9 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         approvalPolicy: "never", // buildThreadParams enforces this on thread/start.
         clientOptions: {
           command: codexExe ?? "codex",
+          // Optional spawn-args override — normal runs use the vendored default
+          // (["app-server", "--listen", "stdio://"]); tests inject a mock server.
+          ...(Array.isArray(codexArgs) && codexArgs.length ? { args: codexArgs } : {}),
           cwd,
           approvalPolicy: "never",
           requestHandler: denyServerRequest,
