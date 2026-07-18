@@ -63,7 +63,7 @@ Ported from the working v1 with these changes:
   - one correction round max on verify failure; failed-twice → status "failed", hand-fix, never a third dispatch
   - reviews are adversarial, independently re-run tests, verdict approve/needs_work/reject
   - return contract `{results: [{taskId, driver, review}], approvedBranches, worktreeBase}`
-  - merging is manual and sequential; never auto-merge
+  - merging is manual and sequential; never auto-merge *[superseded by A1: integration modes, default `stage`]*
 
 ### Setup skill (`skills/setup/SKILL.md`)
 
@@ -84,8 +84,8 @@ The v1 `/fleet` skill generalized:
 - Reads `config.json`; missing → instruct running `/codex-fleet:setup` first.
 - Spec-writing rules (unchanged from v1): ground specs in actual code first with file/line anchors; surgical single-concern test-anchored tasks; explicit "Do not modify X"; prefer disjoint file sets, pin different insertion anchors when a shared file is unavoidable; never ask Codex to run tests (its sandbox cannot execute local toolchains — driver verifies outside).
 - Invokes the engine: `Workflow({scriptPath: '<plugin root>/workflows/codex-fleet.js', args: {repo, mode, codexExe, platform, verify, tasks}})` — `mode` from `authMode` (`none` → `claude`, else `codex`).
-- Merge protocol (unchanged from v1): clear untracked local build artifacts first; per branch best-verdict-first `git merge --no-ff --no-commit` → `git rm` review-flagged strays → commit; FULL project verification after each merge; abort/drop on failure; worktree remove + branch delete; report.
-- **Telemetry (new, C):** after each run, append one JSON line to `${CLAUDE_PLUGIN_DATA}/fleet-log.jsonl` (`{ts, repo, taskIds, verdicts, approvedBranches, subagentTokens}`) and rewrite `${CLAUDE_PLUGIN_DATA}/approved.json` (`{"<canonical-repo-key>": {"codex/<id>": "approve"|"needs_work"|"reject", ...}}`, key form defined in the Merge-guard section) for the merge-guard. `subagentTokens` comes from the harness's workflow-completion usage report (the `subagent_tokens` figure in the task notification), not from the engine's return value; if unavailable, the field is omitted rather than fabricated.
+- Merge protocol *[superseded by A1 — this v1 flow survives only as `integrate: "commit"` mode]*: clear untracked local build artifacts first; per branch best-verdict-first `git merge --no-ff --no-commit` → `git rm` review-flagged strays → commit; FULL project verification after each merge; abort/drop on failure; worktree remove + branch delete; report.
+- **Telemetry (new, C):** after each run, append one JSON line to `${CLAUDE_PLUGIN_DATA}/fleet-log.jsonl` (`{ts, repo, taskIds, verdicts, approvedBranches, subagentTokens}`) and update `${CLAUDE_PLUGIN_DATA}/approved.json` *[flat-string schema and "rewrite" wording superseded by A3: sha-keyed entry objects, read-modify-write, write-before-integrate]* for the merge-guard. `subagentTokens` comes from the harness's workflow-completion usage report (the `subagent_tokens` figure in the task notification), not from the engine's return value; if unavailable, the field is omitted rather than fabricated.
 - **Claude-only fallback:** when `authMode: none`, the same pipeline runs with Claude subagents implementing instead of Codex (worktrees, verify, review, merge protocol all identical).
 
 ### Agents (`agents/`) — C addition
@@ -105,7 +105,7 @@ The v1 `/fleet` skill generalized:
 
 ### README
 
-- Two-command install: `/plugin marketplace add wenbinio/claudeorchestratortocodex`, `/plugin install codex-fleet@<marketplace-name>`.
+- Two-command install: `/plugin marketplace add wenbinio/claudeorchestratortocodex`, `/plugin install codex-fleet@wenbinio` *[marketplace name resolved per A6]*.
 - Sandbox enablement: copy-paste `.claude/settings.json` block (`enabledPlugins` + `extraKnownMarketplaces`) to check into any repo that should have fleet access in claude.ai/code sessions; `OPENAI_API_KEY` as environment secret; note that the merge-guard hook is local-only (skills and agents DO load in sandboxes).
 - Requirements: Codex CLI (desktop app on Windows, npm package elsewhere), an OpenAI auth (ChatGPT login or API key), git.
 - Honest cost note: Codex usage bills to the user's OpenAI plan; fleet runs also consume Claude tokens.
@@ -118,7 +118,7 @@ After installing the plugin locally: delete `~/.claude/skills/fleet/`, delete `D
 
 1. **Engine parity:** re-run the proven fleet-test lifecycle (throwaway git repo, 2 parallel tasks, pre-written failing tests) through the plugin-installed engine path on this machine. Same green outcome required.
 2. **Skill GREEN tests:** plan-only subagent given each skill's content must produce the correct invocation, return-contract handling, and merge protocol (method proven in v1 skill development).
-3. **Hook test:** attempt merging an unapproved `codex/*` branch → blocked with message; merge an approved branch → allowed; merge an unrelated branch → guard silent; corrupt `approved.json` → fail-open.
+3. **Hook test** *[case matrix updated per A3]*: recorded branch + matching sha + `reject` verdict → BLOCK with message (positive discriminating case — a dead guard fails it); matching sha + `approve` → allow; sha-mismatch → allow; repo key absent → allow; unrelated branch → guard silent; corrupt `approved.json` → fail-open; `merge --squash` form → same matrix.
 4. **Setup test:** delete `config.json`, run setup, verify discovery + auth classification + rewrite.
 5. **Sandbox surface:** verified by documentation/inspection only until the user opens a cloud session on a fleet-enabled repo. Explicitly flagged as the one untested surface at release.
 
@@ -132,7 +132,7 @@ After installing the plugin locally: delete `~/.claude/skills/fleet/`, delete `D
 | 4 | Workflow `args` may arrive JSON-stringified | engine normalizes both forms |
 | 5 | `-o` file inside worktree gets committed | capture file placed beside worktree |
 | 6 | verify-generated artifacts collide at merge | driver purges pre-commit; merge protocol clears local untracked first |
-| 7 | xhigh reasoning exceeds foreground tool timeouts | codex exec runs in background with completion notification |
+| 7 | xhigh reasoning exceeds foreground tool timeouts | foreground + resume ladder *[superseded by A4]* |
 | 8 | Hooks/monitors inert in cloud sandboxes | guard is local-only seatbelt; skill protocol is the enforcement |
 | 9 | Interactive ChatGPT OAuth impossible headless | sandbox auth = API key or Claude-only fallback |
 
@@ -154,7 +154,13 @@ User requirement: fleet output should land like native in-terminal Claude Code w
 
 `integrate` mode on dispatch, default **`stage`**:
 
-- **`stage` (default):** approved branches are squash-applied sequentially to the caller's working tree (`git merge --squash`), FULL project verification after each apply, nothing ever committed. Conflict or red verify → that branch's squash is cleanly reset, the branch is parked for inspection, integration continues with the rest. End state: verified staged diff + report naming what integrated and what parked and why. Worktrees and integrated branches auto-cleaned (provenance persists in fleet-log.jsonl); parked branches kept.
+- **`stage` (default):** temp-commit ladder with a final soft reset — the ONLY sanctioned mechanism (naive commitless sequential squashing is mechanically impossible: the first squash dirties the index and every subsequent `git merge` refuses to start).
+  1. Precondition: caller's working tree must be clean; dirty → abort integration with a message (never stash silently).
+  2. Record `ORIG = HEAD`. Per approved branch in verdict order: `git merge --squash codex/<id>` then a TEMP commit `fleet-stage: <id>`; run FULL project verification.
+  3. Red verify → `git reset --hard HEAD~1` (drops only that branch's temp commit; earlier branches' work is safe in ancestor temp commits); squash conflict → `git reset --hard HEAD` after aborting the squash state. Either way the branch is parked and integration continues.
+  4. After the last branch: `git reset --soft ORIG` — every integrated change lands as one staged, verified, uncommitted diff; zero commits remain in history.
+  5. Report names what integrated and what parked and why. Worktrees + integrated branches auto-cleaned (provenance persists in fleet-log.jsonl); parked branches kept.
+  Shared-file batches work naturally — each squash applies onto the previous temp commit.
 - **`commit`:** the original per-branch `--no-ff` merge-commit protocol.
 - **`manual`:** branches only; no integration.
 
@@ -168,6 +174,7 @@ User requirement: per-worker prompt/result overviews, tool uses, and transcripts
 - After each worker: driver distills events into `${CLAUDE_PLUGIN_DATA}/transcripts/<run>/<task-id>.md` with sections PROMPT / TIMELINE (each command Codex ran + exit status, each file patched) / FINAL MESSAGE / USAGE (tokens, duration, session id).
 - Driver structured output gains: `codexCommandsRun`, `filesPatched`, `sessionId`, `transcriptPath`.
 - Dispatch's end-of-run report shows one overview line per worker + clickable transcript path. Workers are not `--ephemeral`, so sessions also appear natively in the Codex app's session list; `codex exec resume <sessionId>` works for post-hoc interrogation.
+- **Wrapper-agent rule: raw-shell Codex dispatches are an anti-pattern.** EVERY Codex invocation — fleet workers, one-off auditors, ad-hoc oneshots — runs inside a thin Claude driver agent, never as a bare background shell call. Rationale (observed): the harness gives agents live narration, token/tool-use counts, and a View-transcript link; a bare shell call renders as an opaque task chip with none of that. The wrapper costs one subagent and buys full observability parity; the dispatch skill must state this rule and provide the one-off dispatch shape.
 
 ## A3. Merge-guard redesign (fixes audit findings: name-reuse bypass, rewrite ambiguity, matcher gap, arbitration, env fallback, stale-verdict dead end, undetectable-dead-guard)
 
@@ -176,12 +183,14 @@ User requirement: per-worker prompt/result overviews, tool uses, and transcripts
 - **Matcher explicitly enumerates both shell tools**: `Bash|PowerShell`. Both guard scripts are registered; PreToolUse semantics make any exit-2 win over any exit-0 (block wins). The `.sh` detects Windows (`uname` → `MINGW*|MSYS*|CYGWIN*`) and exits 0 immediately; the `.ps1` is inherently Windows-gated by its interpreter.
 - **Data-dir resolution in guards must not depend on `${CLAUDE_PLUGIN_DATA}` reaching the hook environment**: scripts try the env var, then fall back to `~/.claude/plugins/data/codex-fleet/`. This assumption is explicitly flagged VERIFY-AT-BUILD.
 - **Honest coverage statement (docs + README):** the guard matches `git merge` of `codex/*` only; rebase/cherry-pick/pull bypass it; it gates only Claude's tool calls. It is an advisory seatbelt. The dispatch skill's protocol is the enforcement.
-- **Positive discriminating test required:** seed a real branch + recorded `reject` with matching sha, attempt the merge via Claude's shell tool, and REQUIRE the block message. A dead guard fails this test. (The corrupt-file fail-open test alone cannot distinguish working from dead.)
+- **Write-before-integrate ordering (A1 interaction):** the dispatch skill updates `approved.json` from the engine's verdicts BEFORE integration begins — never after. Otherwise, on any repo with entries from a prior run, the guard sees a present repo key with the new branches absent and blocks the skill's own apply commands. The guard matches both `git merge` and `git merge --squash` of `codex/*` branches; stage-mode applies passing the guard (approve + sha match → allow) is by design.
+- **Positive discriminating test required:** seed a real branch + recorded `reject` with matching sha, attempt the merge via Claude's shell tool, and REQUIRE the block message. A dead guard fails this test. (The corrupt-file fail-open test alone cannot distinguish working from dead.) Full guard test matrix: name+sha+bad-verdict → block; sha-mismatch → allow; repo-key absent → allow; `merge --squash` form → same behaviors.
 
 ## A4. Review and driver-protocol hardening (fixes: emergent-behavior overclaim; StructuredOutput dropout — observed live when 4/5 drivers orphaned their workers)
 
 - **Reviewer prompt MANDATES independently re-running the task's verify command** (v1 only implied it in skill prose; v1 engine never instructed it — reviewers did it voluntarily; v2 makes it a hard instruction). Verdict `approve` requires the reviewer's own green run.
 - **Codex dispatch runs FOREGROUND** with explicit tool timeout (≤10 min); `run_in_background` is forbidden inside workflow drivers (observed failure: driver ends turn awaiting notification → harness treats as complete → worker orphaned, output lost).
+- **Long-worker policy (resolves the tension with constraint #7, which this supersedes):** a worker that hits the 10-min foreground window is continued, not abandoned — the driver kills the timed-out process and runs `codex exec resume <sessionId> "continue"` (sessionId is available early from the A2 `--json` stream) for at most ONE additional 10-min window. Still unfinished after two windows → task failed with explicit "decompose this task" guidance in the report. Task specs may also pass a lower reasoning effort (`-c model_reasoning_effort=high`) for mechanical work. Constraint #7's row now points here.
 - **Always-report rule:** the driver's final action MUST be the StructuredOutput call — on any failure, interruption, or nudge, report `status: "failed"` with best-available fields; never end in prose.
 - **Recovery principle:** the worktree + branch state is ground truth; a lost driver report must be recoverable by inspecting git state, and the dispatch skill's report step must fall back to that when structured output is missing.
 
