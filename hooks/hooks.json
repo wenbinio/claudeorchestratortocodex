@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File '${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.ps1'"
+          },
+          {
+            "type": "command",
+            "command": "sh '${CLAUDE_PLUGIN_ROOT}/scripts/merge-guard.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
