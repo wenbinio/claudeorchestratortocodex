@@ -292,3 +292,8 @@ Two independent improvement passes (GPT-5.6-Sol read-only; Fable full-context) c
 
 ### Out of scope for v0.3 (deferred, logged)
 Reviewer-steer round (Fable #4), crash `--resume` (Fable #3), live supervision dashboard (Fable #5), commit provenance trailers (Fable #7) — all valuable, all sit cleanly on the unified core once it exists. `plugin.json` → `0.3.0`.
+
+### Wave 1 review follow-ups (adversarial review of the recovered core; non-blocking, logged)
+- **exec transport prompt size (MAJOR):** `runner/transports/exec.mjs` passes the full prompt as one shell arg; Windows caps the command line near 32 KB. Our task specs are small (a few KB) so it's latent, but a large spec + a long verify-failure tail on a correction round could truncate. Fix in a follow-up by feeding the prompt via a temp file / stdin. app-server (the normative transport) is unaffected — it sends prompts over JSON-RPC.
+- **vendored singleton options (MAJOR-latent):** the vendored `getClient` is a process-wide singleton that ignores its options once ready, so only the first worker's `codexExe`/`requestHandler` take effect. Harmless for uniform fleet batches (identical binary + handler); add an assertion if mixed-binary batches are ever supported.
+- **Process note:** the Wave 1 build itself was bitten by defect #1 — a worker's `codex exec resume` ran without `-C` and leaked files into the main tree. Recovered without loss (files backed up, tree restored, branch reconstructed, blocker fixed on review). The v0.3 runner-first lifecycle removes this failure mode: the runner owns the turn/resume, so no orchestrator prompt can misplace `-C`.
