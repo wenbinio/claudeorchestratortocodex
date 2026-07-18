@@ -9,8 +9,8 @@ Plan the work, run the bundled fleet workflow, record its verdicts, and integrat
 
 ## Load configuration and inputs
 
-1. Resolve the data directory to `${CLAUDE_PLUGIN_DATA}` when it is available; otherwise use `~/.claude/plugins/data/codex-fleet/`.
-2. Read `config.json` from that directory. If it is missing, stop and run `/codex-fleet:setup` first, then re-read it. Do not guess a Codex path or authentication mode.
+1. Resolve the data directory to `${CLAUDE_PLUGIN_DATA}` when it is available; otherwise glob `~/.claude/plugins/data/*codex-fleet*/` (the on-disk id may be plugin-name or marketplace-qualified); otherwise use `~/.claude/plugins/data/codex-fleet/`.
+2. Read `config.json` from that directory. If it is missing, stop and run `/codex-fleet:setup` first, then re-read it. Do not guess a Codex path or authentication mode. If the recorded `codexExe` no longer exists on disk (hash-versioned paths go stale on app updates), re-run setup discovery before dispatching. Pass `model` and `effort` from config.json into the workflow args so workers never silently inherit a machine's Codex defaults.
 3. Require `repo` to name a git repository with at least one commit. Resolve `verify` to the full-project verification command and `tasks` to objects shaped like `{id, spec, verify?}`.
 4. Set `mode` from `authMode`: use `claude` when it is `none`, and `codex` for `subscription` or `api_key`. Pass through `codexExe` and `platform`. The workflow, not this skill, owns the Claude-only fallback pipeline.
 5. Accept `integrate: stage | commit | manual`; default to `stage`.
@@ -47,7 +47,17 @@ Workflow({
 })
 ```
 
-Expect `{results: [{taskId, driver, review}], approvedBranches, worktreeBase}`. Trust the adversarial review verdict over the driver's self-assessment. An `approve` verdict is valid only after the reviewer independently re-runs the task's verify command and gets green.
+Expect `{results: [{taskId, driver, review}], approvedBranches, worktreeBase}`. Trust the adversarial review verdict over the driver's self-assessment. An `approve` verdict is valid only after the reviewer independently re-runs the task's verify command and gets green. Tasks with no verify command produce `unverified` branches, which never enter `approvedBranches` unless the task sets `allowUnverified: true`.
+
+## Runtime fallback — stock installations without the Workflow tool
+
+The Workflow tool is not part of the documented stock Claude Code tool surface. If it is unavailable, DO NOT abandon the run and DO NOT fall back to bare shell calls. Orchestrate the identical pipeline with parallel Agent-tool subagents:
+
+1. For each task, spawn one driver subagent (agentType `codex-fleet:codex-driver`; on resolution failure, a general-purpose agent with the same prompt). Its prompt carries the full driver lifecycle: isolated worktree on `codex/<id>` (existing branch = error, never silent delete), foreground Codex dispatch with `--json`, closed stdin, model/effort pinned, 10-minute window + one resume continuation, verify, one correction round, artifact purge, commit, audit, structured report.
+2. As each driver finishes, spawn its reviewer subagent (agentType `codex-fleet:fleet-reviewer`) with the adversarial review duties including the mandatory independent verify re-run.
+3. Assemble `{results, approvedBranches, worktreeBase}` yourself applying the same approval rule (approve verdict + green verify; unverified excluded unless opted in).
+
+The bundled `workflows/codex-fleet.js` remains the canonical statement of the pipeline contract — read it when in doubt about any step. Both paths MUST produce the same branch layout, verdict semantics, and report shape.
 
 ## Enforce worker observability
 

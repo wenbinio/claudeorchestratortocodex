@@ -8,7 +8,7 @@ esac
 
 block_merge() {
     printf '%s\n' \
-        "Merge blocked for branch '$1' (verdict: $2). This hook gates only Claude's tool calls; the user's own terminal is unaffected. Path forward: apply the reviewer's fixes or re-run dispatch." \
+        "Merge blocked for branch '$1' (verdict: $2). This hook gates only Claude's tool calls; the user's own terminal is unaffected. Path forward: apply the reviewer's fixes and re-run dispatch to re-review, or merge from your own terminal." \
         >&2
     exit 2
 }
@@ -99,7 +99,15 @@ if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
     data_dir=$CLAUDE_PLUGIN_DATA
 else
     [ -n "${HOME:-}" ] || exit 0
-    data_dir=$HOME/.claude/plugins/data/codex-fleet
+    # Marketplace installs may qualify the data-dir id; glob before assuming the bare name.
+    data_dir=""
+    for candidate in "$HOME"/.claude/plugins/data/*codex-fleet*/; do
+        if [ -d "$candidate" ]; then
+            data_dir=${candidate%/}
+            break
+        fi
+    done
+    [ -n "$data_dir" ] || data_dir=$HOME/.claude/plugins/data/codex-fleet
 fi
 
 approved_file=$data_dir/approved.json
@@ -176,7 +184,9 @@ while IFS= read -r branch; do
     recorded_sha_lower=$(printf '%s' "$recorded_sha" | tr '[:upper:]' '[:lower:]') || exit 0
     current_sha_lower=$(printf '%s' "$current_sha" | tr '[:upper:]' '[:lower:]') || exit 0
     if [ "$recorded_sha_lower" != "$current_sha_lower" ]; then
-        continue
+        # A7.8 block-on-stale: a RECORDED branch that changed since review is
+        # stale/unreviewed — blocking closes the amend-one-commit bypass.
+        block_merge "$branch" "stale (branch changed since review)"
     fi
 
     verdict_status=$(

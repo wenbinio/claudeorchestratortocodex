@@ -9,7 +9,7 @@ function Stop-Merge {
     [Console]::Error.WriteLine(
         "Merge blocked for branch '$Branch' (verdict: $Verdict). " +
         "This hook gates only Claude's tool calls; the user's own terminal is unaffected. " +
-        "Path forward: apply the reviewer's fixes or re-run dispatch."
+        "Path forward: apply the reviewer's fixes and re-run dispatch to re-review, or merge from your own terminal."
     )
     exit 2
 }
@@ -122,7 +122,13 @@ try {
         if ([string]::IsNullOrWhiteSpace($HOME)) {
             exit 0
         }
-        $dataDir = Join-Path $HOME '.claude/plugins/data/codex-fleet'
+        # Marketplace installs may qualify the data-dir id; glob before assuming the bare name.
+        $globMatches = @(Get-ChildItem -LiteralPath (Join-Path $HOME '.claude/plugins/data') -Directory -Filter '*codex-fleet*' -ErrorAction SilentlyContinue)
+        if ($globMatches.Count -ge 1) {
+            $dataDir = $globMatches[0].FullName
+        } else {
+            $dataDir = Join-Path $HOME '.claude/plugins/data/codex-fleet'
+        }
     }
 
     $approvedPath = Join-Path $dataDir 'approved.json'
@@ -193,7 +199,9 @@ try {
                 $recordedSha,
                 [StringComparison]::OrdinalIgnoreCase
             )) {
-            continue
+            # A7.8 block-on-stale: a RECORDED branch that changed since review is
+            # stale/unreviewed — blocking closes the amend-one-commit bypass.
+            Stop-Merge -Branch $branch -Verdict 'stale (branch changed since review)'
         }
 
         $verdictProperty = @($entry.PSObject.Properties | Where-Object {

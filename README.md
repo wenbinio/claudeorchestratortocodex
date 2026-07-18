@@ -54,7 +54,7 @@ Cloud sessions cannot run `/plugin`. Check this exact block into `.claude/settin
 }
 ```
 
-Add `OPENAI_API_KEY` as an environment secret. Skills and agents load in cloud sandboxes, but the merge-guard hook is local-only. Without a key, the plugin falls back to Claude subagents implementing the tasks under the same worktree, verification, review, and integration pipeline.
+Add `OPENAI_API_KEY` as an environment secret. Skills and agents load in cloud sandboxes, and hooks (including the merge-guard) run in cloud sessions as well, with `CLAUDE_CODE_REMOTE=true` set there — though cloud guard behavior is on the untested-at-release list below. Without a key, the plugin falls back to Claude subagents implementing the tasks under the same worktree, verification, review, and integration pipeline.
 
 ## Merge guard
 
