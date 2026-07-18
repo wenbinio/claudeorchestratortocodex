@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.codex-last.txt
+node_modules/
+.DS_Store
