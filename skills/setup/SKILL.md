@@ -47,17 +47,19 @@ Do not start an interactive OAuth flow in a headless or cloud session.
 
 ## Write configuration
 
-Write `<dataDir>/config.json` with exactly these four keys and no credentials:
+Write `<dataDir>/config.json` with exactly these six keys and no credentials:
 
 ```json
 {
   "codexExe": "<absolute executable path>",
   "platform": "windows",
   "authMode": "subscription",
+  "model": "gpt-5.6-sol",
+  "effort": "xhigh",
   "verifiedAt": "<ISO-8601 UTC timestamp>"
 }
 ```
 
-Use the actual `platform` and `authMode`; encode `codexExe` as JSON `null` when unavailable. Set `verifiedAt` to the time this setup attempt completed. Report the config path, discovered executable, platform, and authentication classification without exposing any secret.
+Use the actual `platform` and `authMode`; encode `codexExe` as JSON `null` when unavailable. `model` and `effort` default to `gpt-5.6-sol` / `xhigh`; honor explicit values from the machine's `~/.codex/config.toml` when present so fleet workers match the user's chosen model. Set `verifiedAt` to the time this setup attempt completed. Report the config path, discovered executable, platform, and authentication classification without exposing any secret.
 
 If `authMode` is `none`, explain that `/codex-fleet:dispatch` will run the same worktree, verification, review, and integration pipeline in Claude-only mode. The plugin data directory's persistence in cloud sandboxes is unverified, so setup may need to be run again in each cloud session.

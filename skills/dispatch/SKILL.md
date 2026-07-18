@@ -37,6 +37,8 @@ Workflow({
     mode,
     codexExe,
     platform,
+    model,
+    effort,
     verify,
     tasks,
     agentTypes: {
