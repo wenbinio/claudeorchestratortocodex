@@ -11,6 +11,7 @@ import { runTask } from "./task-runner.mjs";
 const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 const DEFAULT_MAX_PARALLEL = 4;
 const PROBE_TIMEOUT_MS = 60_000;
+const USAGE = "usage: fleet-runner.mjs --batch <batch.json> | --probe | --cleanup <batch.json> [--delete-branches]";
 const TRANSPORT_URLS = {
   "app-server": new URL("./transports/app-server.mjs", import.meta.url),
   exec: new URL("./transports/exec.mjs", import.meta.url),
@@ -25,9 +26,10 @@ class CliError extends Error {
 }
 
 function parseArgs(argv) {
-  const args = { batch: null, probe: false };
+  const args = { batch: null, cleanup: null, deleteBranches: false, probe: false };
   const valueOptions = new Map([
     ["--batch", "batch"],
+    ["--cleanup", "cleanup"],
     ["--codex-exe", "codexExe"],
     ["--cwd", "cwd"],
     ["--model", "model"],
@@ -41,6 +43,10 @@ function parseArgs(argv) {
       args.probe = true;
       continue;
     }
+    if (option === "--delete-branches") {
+      args.deleteBranches = true;
+      continue;
+    }
     const key = valueOptions.get(option);
     if (!key) throw new CliError(`unknown option: ${option}`);
     if (index + 1 >= argv.length) throw new CliError(`${option} requires a value`);
@@ -48,7 +54,9 @@ function parseArgs(argv) {
     index += 1;
   }
 
-  if (args.probe && args.batch) throw new CliError("use either --probe or --batch, not both");
+  const modes = [Boolean(args.batch), args.probe, Boolean(args.cleanup)].filter(Boolean).length;
+  if (modes > 1) throw new CliError("use exactly one of --batch, --probe, or --cleanup");
+  if (args.deleteBranches && !args.cleanup) throw new CliError("--delete-branches requires --cleanup");
   return args;
 }
 
@@ -117,6 +125,9 @@ function validateBatch(raw) {
   if (raw.outDir != null && (typeof raw.outDir !== "string" || !raw.outDir.trim())) {
     throw new CliError("batch outDir must be a non-empty string when provided");
   }
+  if (raw.wtBase != null && (typeof raw.wtBase !== "string" || !raw.wtBase.trim())) {
+    throw new CliError("batch wtBase must be a non-empty string when provided");
+  }
   if (raw.maxParallel != null && (!Number.isInteger(raw.maxParallel) || raw.maxParallel < 1)) {
     throw new CliError("batch maxParallel must be a positive integer");
   }
@@ -138,8 +149,38 @@ function validateBatch(raw) {
   }
 }
 
+function validateCleanupBatch(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new CliError("batch must be a JSON object");
+  }
+  if (typeof raw.repo !== "string" || !raw.repo.trim()) {
+    throw new CliError("batch needs a non-empty repo");
+  }
+  if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) {
+    throw new CliError("batch needs a non-empty tasks array");
+  }
+  if (raw.wtBase != null && (typeof raw.wtBase !== "string" || !raw.wtBase.trim())) {
+    throw new CliError("batch wtBase must be a non-empty string when provided");
+  }
+  if (raw.outDir != null && (typeof raw.outDir !== "string" || !raw.outDir.trim())) {
+    throw new CliError("batch outDir must be a non-empty string when provided");
+  }
+  if (raw.runId != null && (typeof raw.runId !== "string" || !raw.runId.trim())) {
+    throw new CliError("batch runId must be a non-empty string when provided");
+  }
+
+  const seen = new Set();
+  for (const task of raw.tasks) {
+    if (!task || typeof task !== "object" || Array.isArray(task) || !TASK_ID_RE.test(task.id ?? "")) {
+      throw new CliError(`invalid task id: ${JSON.stringify(task?.id)}`);
+    }
+    if (seen.has(task.id)) throw new CliError(`duplicate task id: ${task.id}`);
+    seen.add(task.id);
+  }
+}
+
 async function readBatch(batchPath) {
-  if (!batchPath) throw new CliError("usage: fleet-runner.mjs --batch <batch.json> | --probe");
+  if (!batchPath) throw new CliError(USAGE);
   let text;
   try {
     text = await fsp.readFile(path.resolve(batchPath), "utf8");
@@ -166,6 +207,108 @@ async function runProcess(command, args) {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
+}
+
+function pluginDataDir() {
+  return path.resolve(process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), ".claude", "plugins", "data", "codex-fleet"));
+}
+
+function cleanupWorktreeBase(cfg) {
+  if (cfg.wtBase) return path.resolve(cfg.wtBase);
+  if (cfg.outDir) return path.join(path.resolve(cfg.outDir), "worktrees");
+  if (cfg.runId) return path.join(pluginDataDir(), "runs", cfg.runId, "worktrees");
+  throw new CliError("cleanup batch needs wtBase, outDir, or runId to locate the original worktrees");
+}
+
+function processFailure(result) {
+  return result.stderr.trim() || result.stdout.trim() || `process exited ${result.code ?? result.signal ?? "unknown"}`;
+}
+
+async function pathExists(target) {
+  try {
+    await fsp.lstat(target);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function cleanupBatch(args) {
+  const cfg = await readBatch(args.cleanup);
+  validateCleanupBatch(cfg);
+
+  const repo = path.resolve(cfg.repo);
+  const worktreeBase = cleanupWorktreeBase(cfg);
+  const summary = {
+    worktreeBase,
+    deleteBranches: args.deleteBranches,
+    removed: { worktrees: [], branches: [] },
+    kept: { worktrees: [], branches: [] },
+    pruned: false,
+    errors: [],
+  };
+
+  for (const task of cfg.tasks) {
+    const worktree = path.join(worktreeBase, task.id);
+    let result;
+    try {
+      result = await runProcess("git", ["-C", repo, "worktree", "remove", "--force", worktree]);
+    } catch (error) {
+      result = { code: null, signal: null, stdout: "", stderr: error?.message ?? String(error) };
+    }
+    if (result.code === 0 || !(await pathExists(worktree))) {
+      summary.removed.worktrees.push(worktree);
+    } else {
+      summary.kept.worktrees.push(worktree);
+      summary.errors.push({ resource: worktree, error: processFailure(result) });
+    }
+  }
+
+  let prune;
+  try {
+    prune = await runProcess("git", ["-C", repo, "worktree", "prune"]);
+  } catch (error) {
+    prune = { code: null, signal: null, stdout: "", stderr: error?.message ?? String(error) };
+  }
+  summary.pruned = prune.code === 0;
+  if (!summary.pruned) summary.errors.push({ resource: "git worktree prune", error: processFailure(prune) });
+
+  for (const task of cfg.tasks) {
+    const branch = `codex/${task.id}`;
+    let exists;
+    try {
+      exists = await runProcess("git", ["-C", repo, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+    } catch (error) {
+      exists = { code: null, signal: null, stdout: "", stderr: error?.message ?? String(error) };
+    }
+    if (exists.code === 1) continue;
+    if (exists.code !== 0) {
+      summary.kept.branches.push(branch);
+      summary.errors.push({ resource: branch, error: processFailure(exists) });
+      continue;
+    }
+    if (!args.deleteBranches) {
+      summary.kept.branches.push(branch);
+      continue;
+    }
+
+    let removed;
+    try {
+      removed = await runProcess("git", ["-C", repo, "branch", "-D", branch]);
+    } catch (error) {
+      removed = { code: null, signal: null, stdout: "", stderr: error?.message ?? String(error) };
+    }
+    if (removed.code === 0) {
+      summary.removed.branches.push(branch);
+    } else {
+      summary.kept.branches.push(branch);
+      summary.errors.push({ resource: branch, error: processFailure(removed) });
+    }
+  }
+
+  console.log(JSON.stringify(summary));
+  return summary.errors.length === 0;
 }
 
 async function resolveBaseSha(repo) {
@@ -239,6 +382,21 @@ function failedReport(task, { baseSha, worktreeBase, transcriptDir, summary }) {
   };
 }
 
+function interruptedReport(task, context) {
+  const report = failedReport(task, context);
+  report.status = "interrupted";
+  return report;
+}
+
+function normalizeReport(report) {
+  const { taskId, ...driver } = report;
+  return { taskId, driver, review: null };
+}
+
+function progress(taskId, state) {
+  console.error(`[fleet] ${taskId} ${state}`);
+}
+
 function serializeEvents(events) {
   return events.map((event) => {
     try {
@@ -270,98 +428,181 @@ async function runBatch(args) {
 
   const repo = path.resolve(cfg.repo);
   const runId = cfg.runId ?? defaultRunId();
-  const dataDir = path.resolve(process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), ".claude", "plugins", "data", "codex-fleet"));
-  const outDir = path.resolve(cfg.outDir || path.join(dataDir, "runs", runId));
+  const outDir = path.resolve(cfg.outDir || path.join(pluginDataDir(), "runs", runId));
   await assertExternalRunDirectory(repo, outDir);
 
   const worktreeBase = cfg.wtBase ? path.resolve(cfg.wtBase) : path.join(outDir, "worktrees");
   const transcriptDir = path.join(outDir, "transcripts");
   const eventsDir = path.join(outDir, "events");
+  const resultsPath = path.join(outDir, "results.json");
   await Promise.all([
     fsp.mkdir(worktreeBase, { recursive: true }),
     fsp.mkdir(transcriptDir, { recursive: true }),
     fsp.mkdir(eventsDir, { recursive: true }),
   ]);
 
-  const baseSha = await resolveBaseSha(repo);
-  const transportModule = await import(TRANSPORT_URLS[cfg.backend]);
-  if (typeof transportModule.createWorker !== "function") {
-    throw new CliError(`transport ${cfg.backend} does not export createWorker`, 1);
-  }
+  let baseSha = "";
+  let interruptionRequested = false;
+  let interruptionPromise = null;
+  let writeTail = Promise.resolve();
+  const reports = new Array(cfg.tasks.length);
+  const taskStates = new Array(cfg.tasks.length).fill("pending");
+  const activeWorkers = new Map();
 
-  const timeoutMs = cfg.timeoutMinutes == null ? undefined : cfg.timeoutMinutes * 60_000;
-  const maxParallel = cfg.maxParallel ?? DEFAULT_MAX_PARALLEL;
-  const results = await pool(cfg.tasks, maxParallel, async (task) => {
-    const events = [];
-    const worktree = path.join(worktreeBase, task.id);
-    let worker = null;
-    let report = failedReport(task, {
-      baseSha,
-      worktreeBase,
-      transcriptDir,
-      summary: "worker did not start",
-    });
-
-    try {
-      worker = await transportModule.createWorker({
-        codexExe: cfg.codexExe,
-        codexArgs: cfg.codexArgs,
-        cwd: worktree,
-        model: cfg.model,
-        effort: cfg.effort,
-        onEvent: (event) => events.push(event),
-      });
-      report = await runTask({
-        repo,
-        baseSha,
-        task,
-        verify: cfg.verify,
-        transport: worker,
-        wtBase: worktreeBase,
-        transcriptDir,
-        timeoutMs,
-      });
-      worker = null; // runTask owns and closes an accepted worker.
-    } catch (error) {
-      await worker?.close?.().catch(() => {});
-      report = failedReport(task, {
-        baseSha,
-        worktreeBase,
-        transcriptDir,
-        summary: `runner error: ${error?.message ?? String(error)}`,
-      });
-    }
-
-    try {
-      await atomicWrite(path.join(eventsDir, `${task.id}.codex-events.jsonl`), serializeEvents(events));
-    } catch (error) {
-      report.status = "failed";
-      report.summary = `${report.summary}${report.summary ? "; " : ""}event write failed: ${error?.message ?? String(error)}`;
-    }
-    return report;
-  });
-
-  const payload = {
+  const payload = (complete) => ({
     runId,
-    results,
+    results: reports.filter(Boolean).map(normalizeReport),
     approvedBranches: [],
     worktreeBase,
     outDir,
-  };
-  const resultsPath = path.join(outDir, "results.json");
-  await atomicWriteJson(resultsPath, payload);
-  await atomicAppendJsonLine(path.join(outDir, "runner-journal.jsonl"), {
-    ranAt: new Date().toISOString(),
-    runId,
-    repo,
-    baseSha,
-    backend: cfg.backend,
-    tasks: cfg.tasks.map((task) => task.id),
-    statuses: results.map((result) => result.status),
+    complete,
   });
+  const writeResults = (complete) => {
+    const snapshot = payload(complete);
+    const write = writeTail.then(() => atomicWriteJson(resultsPath, snapshot));
+    writeTail = write.catch(() => {});
+    return write;
+  };
+  const requestInterruption = (signal) => {
+    if (interruptionPromise) return;
+    interruptionRequested = true;
+    for (let index = 0; index < cfg.tasks.length; index += 1) {
+      if (taskStates[index] !== "pending" && taskStates[index] !== "running") continue;
+      const task = cfg.tasks[index];
+      taskStates[index] = "interrupted";
+      reports[index] = interruptedReport(task, {
+        baseSha,
+        worktreeBase,
+        transcriptDir,
+        summary: `fleet run interrupted by ${signal}`,
+      });
+      progress(task.id, "interrupted");
+    }
 
-  const done = results.filter((result) => result.status === "done").length;
-  console.log(`fleet-runner: ${done}/${results.length} done. results -> ${resultsPath}`);
+    const workers = [...activeWorkers.entries()];
+    interruptionPromise = (async () => {
+      const closed = await Promise.allSettled(workers.map(([, worker]) => worker.close()));
+      for (let index = 0; index < closed.length; index += 1) {
+        if (closed[index].status === "fulfilled") continue;
+        const [taskIndex] = workers[index];
+        const report = reports[taskIndex];
+        const detail = closed[index].reason?.message ?? String(closed[index].reason);
+        report.summary = `${report.summary}; transport close failed: ${detail}`;
+      }
+      await writeResults(false);
+    })().catch((error) => {
+      console.error(`fatal: could not persist interrupted results: ${error?.message ?? String(error)}`);
+    }).finally(() => {
+      process.exit(130);
+    });
+  };
+  const onSigint = () => requestInterruption("SIGINT");
+  const onSigterm = () => requestInterruption("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+
+  try {
+    baseSha = await resolveBaseSha(repo);
+    if (interruptionRequested) return;
+    const transportModule = await import(TRANSPORT_URLS[cfg.backend]);
+    if (typeof transportModule.createWorker !== "function") {
+      throw new CliError(`transport ${cfg.backend} does not export createWorker`, 1);
+    }
+    if (interruptionRequested) return;
+
+    await writeResults(false);
+    if (interruptionRequested) return;
+
+    const timeoutMs = cfg.timeoutMinutes == null ? undefined : cfg.timeoutMinutes * 60_000;
+    const maxParallel = cfg.maxParallel ?? DEFAULT_MAX_PARALLEL;
+    await pool(cfg.tasks, maxParallel, async (task, taskIndex) => {
+      if (interruptionRequested) return reports[taskIndex];
+      taskStates[taskIndex] = "running";
+      progress(task.id, "start");
+
+      const events = [];
+      const worktree = path.join(worktreeBase, task.id);
+      let worker = null;
+      let report = failedReport(task, {
+        baseSha,
+        worktreeBase,
+        transcriptDir,
+        summary: "worker did not start",
+      });
+
+      try {
+        worker = await transportModule.createWorker({
+          codexExe: cfg.codexExe,
+          codexArgs: cfg.codexArgs,
+          cwd: worktree,
+          model: cfg.model,
+          effort: cfg.effort,
+          onEvent: (event) => events.push(event),
+        });
+        activeWorkers.set(taskIndex, worker);
+        if (interruptionRequested) {
+          await worker.close().catch(() => {});
+          return reports[taskIndex];
+        }
+        report = await runTask({
+          repo,
+          baseSha,
+          task,
+          verify: cfg.verify,
+          transport: worker,
+          wtBase: worktreeBase,
+          transcriptDir,
+          timeoutMs,
+        });
+        worker = null; // runTask owns and closes an accepted worker.
+      } catch (error) {
+        await worker?.close?.().catch(() => {});
+        if (interruptionRequested) return reports[taskIndex];
+        report = failedReport(task, {
+          baseSha,
+          worktreeBase,
+          transcriptDir,
+          summary: `runner error: ${error?.message ?? String(error)}`,
+        });
+      } finally {
+        activeWorkers.delete(taskIndex);
+      }
+
+      if (interruptionRequested) return reports[taskIndex];
+      try {
+        await atomicWrite(path.join(eventsDir, `${task.id}.codex-events.jsonl`), serializeEvents(events));
+      } catch (error) {
+        report.status = "failed";
+        report.summary = `${report.summary}${report.summary ? "; " : ""}event write failed: ${error?.message ?? String(error)}`;
+      }
+      if (interruptionRequested) return reports[taskIndex];
+
+      reports[taskIndex] = report;
+      taskStates[taskIndex] = report.status;
+      progress(task.id, report.status);
+      await writeResults(false);
+      return report;
+    });
+
+    if (interruptionRequested) return;
+    await writeResults(true);
+    if (interruptionRequested) return;
+    await atomicAppendJsonLine(path.join(outDir, "runner-journal.jsonl"), {
+      ranAt: new Date().toISOString(),
+      runId,
+      repo,
+      baseSha,
+      backend: cfg.backend,
+      tasks: cfg.tasks.map((task) => task.id),
+      statuses: reports.map((report) => report.status),
+    });
+
+    const done = reports.filter((report) => report.status === "done").length;
+    console.log(`fleet-runner: ${done}/${reports.length} done. results -> ${resultsPath}`);
+  } finally {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+  }
 }
 
 function probeRequestHandler(request) {
@@ -507,6 +748,11 @@ async function main() {
     process.exitCode = capability.compatible ? 0 : 1;
     return;
   }
+  if (args.cleanup) {
+    process.exitCode = (await cleanupBatch(args)) ? 0 : 1;
+    return;
+  }
+  if (!args.batch) throw new CliError(USAGE);
   await runBatch(args);
   process.exitCode = 0;
 }
