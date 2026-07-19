@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import {
   access,
   chmod,
@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 
 const execFileAsync = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +36,6 @@ const DRIVER_REPORT_KEYS = [
   "sessionId",
   "status",
   "summary",
-  "taskId",
   "transcriptPath",
   "unverified",
   "verifyPassed",
@@ -76,7 +76,9 @@ function isInside(parent, candidate) {
 }
 
 function assertFrozenReport(report) {
-  assert.deepEqual(Object.keys(report).sort(), DRIVER_REPORT_KEYS);
+  assert.deepEqual(Object.keys(report).sort(), ["driver", "review", "taskId"]);
+  assert.deepEqual(Object.keys(report.driver).sort(), DRIVER_REPORT_KEYS);
+  assert.equal(report.review, null);
 }
 
 function configureMockExecutable() {
@@ -164,6 +166,10 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
     timeout: 75_000,
   });
   assert.match(fleet.stdout, /fleet-runner:/);
+  assert.match(fleet.stderr, /\[fleet\] repair start/);
+  assert.match(fleet.stderr, /\[fleet\] repair done/);
+  assert.match(fleet.stderr, /\[fleet\] collision start/);
+  assert.match(fleet.stderr, /\[fleet\] collision blocked/);
 
   const resultsPath = path.join(outDir, "results.json");
   assert.equal(await exists(resultsPath), true, "results.json should be written to the explicit outDir");
@@ -171,14 +177,16 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
   assert.equal(await exists(path.join(repo, ".codex-fleet", "results.json")), false);
 
   const payload = JSON.parse(await readFile(resultsPath, "utf8"));
-  assert.deepEqual(Object.keys(payload).sort(), ["approvedBranches", "outDir", "results", "runId", "worktreeBase"]);
+  assert.deepEqual(Object.keys(payload).sort(), ["approvedBranches", "complete", "outDir", "results", "runId", "worktreeBase"]);
   assert.deepEqual(payload.approvedBranches, []);
+  assert.equal(payload.complete, true);
   assert.equal(path.resolve(payload.worktreeBase), path.resolve(wtBase));
   assert.equal(payload.results.length, 2);
   for (const report of payload.results) assertFrozenReport(report);
 
-  const repaired = payload.results.find((report) => report.taskId === "repair");
-  assert.ok(repaired);
+  const repairedResult = payload.results.find((report) => report.taskId === "repair");
+  assert.ok(repairedResult);
+  const repaired = repairedResult.driver;
   assert.equal(repaired.status, "done");
   assert.equal(repaired.branch, "codex/repair");
   assert.equal(repaired.verifyPassed, true);
@@ -201,11 +209,119 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
   assert.match(transcript, /^# USAGE$/m);
   assert.match(transcript, /Mock wrote solution\.txt\./);
 
-  const collision = payload.results.find((report) => report.taskId === "collision");
-  assert.ok(collision);
+  const collisionResult = payload.results.find((report) => report.taskId === "collision");
+  assert.ok(collisionResult);
+  const collision = collisionResult.driver;
   assert.equal(collision.status, "blocked");
   assert.equal(collision.branch, "codex/collision");
   assert.equal(collision.baseSha, baseSha);
   assert.equal(collision.commitSha, "");
   assert.match(collision.summary, /already exists/i);
+
+  const keptCleanup = await run(process.execPath, [FLEET_RUNNER, "--cleanup", batchPath], { cwd: ROOT });
+  const keptSummary = JSON.parse(keptCleanup.stdout);
+  assert.equal(keptSummary.deleteBranches, false);
+  assert.equal(keptSummary.pruned, true);
+  assert.equal(await exists(path.join(wtBase, "repair")), false);
+  assert.deepEqual(keptSummary.kept.branches.sort(), ["codex/collision", "codex/repair"]);
+  assert.match((await git(repo, "branch", "--list", "codex/*")).stdout, /codex\/repair/);
+
+  const deletedCleanup = await run(
+    process.execPath,
+    [FLEET_RUNNER, "--cleanup", batchPath, "--delete-branches"],
+    { cwd: ROOT },
+  );
+  const deletedSummary = JSON.parse(deletedCleanup.stdout);
+  assert.equal(deletedSummary.deleteBranches, true);
+  assert.deepEqual(deletedSummary.removed.branches.sort(), ["codex/collision", "codex/repair"]);
+  assert.equal((await git(repo, "branch", "--list", "codex/*")).stdout.trim(), "");
+});
+
+test("fleet runner interrupts workers and preserves a partial result", {
+  skip: process.platform === "win32" ? "Windows does not deliver child.kill(SIGINT) to a Node signal handler" : false,
+  timeout: 45_000,
+}, async (t) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-interrupt-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const repo = path.join(tempRoot, "repo");
+  const wtBase = path.join(tempRoot, "worktrees");
+  const outDir = path.join(tempRoot, "run-output");
+  await mkdir(repo, { recursive: true });
+  await writeFile(path.join(repo, "fixture.txt"), "base\n", "utf8");
+  await git(repo, "init");
+  await git(repo, "config", "user.name", "Codex Fleet Test");
+  await git(repo, "config", "user.email", "codex-fleet-test@example.invalid");
+  await git(repo, "add", "--", ".");
+  await git(repo, "commit", "-m", "interrupt fixture");
+
+  const { codexExe, codexArgs } = configureMockExecutable();
+  const batchPath = path.join(tempRoot, "batch.json");
+  await writeFile(batchPath, JSON.stringify({
+    repo: await realpath(repo),
+    codexExe,
+    codexArgs,
+    backend: "app-server",
+    runId: "interrupt-test",
+    outDir,
+    wtBase,
+    maxParallel: 1,
+    timeoutMinutes: 1,
+    tasks: [{
+      id: "hold",
+      spec: [
+        "MOCK_WAIT_FOR_INTERRUPT",
+        "```mock-file interrupted.txt",
+        "waiting",
+        "```",
+      ].join("\n"),
+    }],
+  }, null, 2), "utf8");
+
+  const child = spawn(process.execPath, [FLEET_RUNNER, "--batch", batchPath], {
+    cwd: ROOT,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+
+  const activeMarker = path.join(wtBase, "hold", "interrupted.txt");
+  const activeDeadline = Date.now() + 15_000;
+  while (!(await exists(activeMarker))) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`fleet runner exited before its worker became active\n${stdout}\n${stderr}`);
+    }
+    if (Date.now() >= activeDeadline) throw new Error(`timed out waiting for active worker\n${stderr}`);
+    await delay(25);
+  }
+
+  assert.equal(child.kill("SIGINT"), true);
+  const outcome = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for signal shutdown\n${stderr}`)), 15_000);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+  assert.deepEqual(outcome, { code: 130, signal: null });
+  assert.match(stderr, /\[fleet\] hold start/);
+  assert.match(stderr, /\[fleet\] hold interrupted/);
+
+  const payload = JSON.parse(await readFile(path.join(outDir, "results.json"), "utf8"));
+  assert.equal(payload.complete, false);
+  assert.equal(payload.results.length, 1);
+  assertFrozenReport(payload.results[0]);
+  assert.equal(payload.results[0].taskId, "hold");
+  assert.equal(payload.results[0].driver.status, "interrupted");
+  assert.match(payload.results[0].driver.summary, /SIGINT/);
 });

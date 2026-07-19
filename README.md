@@ -143,3 +143,11 @@ The app-server transport and sessionful-worker layer under `vendor/dynamic-workf
 
 Released under the [MIT License](LICENSE). Copyright 2026 wenbinio.
 Vendored code under `vendor/` retains its own upstream MIT license and copyright (see `vendor/dynamic-workflows-codex/`).
+
+## Runner CLI modes
+
+The standalone runner (`node runner/fleet-runner.mjs`) has three modes:
+
+- `--batch <batch.json>` — run a fleet batch. Prints one `[fleet] <task> <state>` progress line per task transition on stderr, and rewrites `results.json` atomically after each task completes (`complete: false` until the run ends), so an interrupted run always leaves salvageable state. Ctrl-C interrupts active workers cleanly and records unfinished tasks as `interrupted`.
+- `--probe` — verify the app-server backend end-to-end (initialize, model list, one ephemeral read-only turn); used by `setup`.
+- `--cleanup <batch.json>` — remove the batch's worktrees (`--delete-branches` additionally deletes unmerged `codex/*` branches). Prints a JSON summary.
