@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -148,9 +148,9 @@ test("delegate streams events, consumes steering, and reuses its warm thread", {
   assert.match(await readFile(path.join(repo, "follow-up.txt"), "utf8"), /^steered\n$/);
 
   await waitFor(async () => {
-    const inboxPath = path.join(runDir, "steer.inbox.jsonl");
-    return !(await exists(inboxPath)) || !(await readFile(inboxPath, "utf8")).trim();
-  }, "steer inbox line was not consumed");
+    const inboxPath = path.join(runDir, "steer.inbox");
+    return !(await exists(inboxPath)) || (await readdir(inboxPath)).length === 0;
+  }, "steer inbox message was not consumed");
 
   const statusResult = await run(process.execPath, [DELEGATE, "--status", runDir], { cwd: ROOT });
   const liveStatus = JSON.parse(statusResult.stdout);
@@ -170,4 +170,29 @@ test("delegate streams events, consumes steering, and reuses its warm thread", {
   assert.equal(turns.length, 2);
   assert.equal(new Set(turns.map((event) => event.threadId)).size, 1);
   assert.equal(events.at(-1).type, "delegate-summary");
+});
+
+test("--steer rejects a completed run", async (t) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-delegate-terminal-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const runDir = path.join(tempRoot, "delegate-run");
+  await mkdir(runDir, { recursive: true });
+  await writeFile(path.join(runDir, "state.json"), `${JSON.stringify({ status: "done" })}\n`, "utf8");
+
+  let rejection;
+  try {
+    await execFileAsync(process.execPath, [DELEGATE, "--steer", runDir, "too late"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.fail("--steer unexpectedly accepted a completed run");
+  } catch (error) {
+    rejection = error;
+  }
+
+  assert.equal(rejection.code, 3);
+  assert.deepEqual(JSON.parse(rejection.stdout), { ok: false, reason: "run is done" });
+  assert.equal(await exists(path.join(runDir, "steer.inbox")), false);
 });
