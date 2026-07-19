@@ -1,6 +1,6 @@
 {
   "name": "codex-fleet",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Claude-orchestrated Codex coding fleet with isolated worktrees, adversarial verification, worker transcripts, and staged integration.",
   "author": {
     "name": "wenbinio"
