@@ -1,47 +1,82 @@
 # Codex Fleet
 
-## What it is
+**Claude plans, reviews, and integrates; Codex writes the code — and nothing lands until an adversarial reviewer independently re-runs the tests and passes it.**
 
-Codex Fleet is a Claude Code plugin for running coding tasks through a controlled multi-worker pipeline. Claude plans the work, verifies it, reviews it, and integrates it; Codex `gpt-5.6-sol` writes the code. Workers run in parallel in isolated Git worktrees, and an adversarial reviewer independently re-runs each task's tests before approval.
+Codex Fleet is a Claude Code plugin that treats LLM-generated code as an untrusted supply chain. You describe the work; Claude drafts grounded task specs and dispatches OpenAI Codex (`gpt-5.6-sol`) workers; each worker runs in its own isolated Git worktree; the Claude driver verifies the result *outside* Codex's sandbox; a separate adversarial reviewer re-runs the verification independently before anything is approved; and only approved work is integrated — landing as one verified, staged diff in your working tree, exactly like a native Claude Code edit.
 
-Seamless staged integration is the flagship behavior and the default `stage` mode: approved work is applied in verdict order, the full project verification runs after each application, and passing changes land as one verified staged diff in your working tree. No fleet commits remain in your history; inspect the diff and commit when ready. Work that conflicts or fails verification is parked on its branch instead of being integrated.
+```text
+you describe work
+   └─ Claude writes grounded, single-concern task specs
+        └─ Codex workers (parallel, isolated worktrees) write code
+             └─ driver verifies OUTSIDE Codex's sandbox
+                  └─ adversarial reviewer re-runs verify independently → approve / needs_work / reject
+                       └─ only approved branches integrate → one staged, verified diff in your tree
+```
 
-## Observability
+## Why this instead of…
 
-Each Codex worker gets a transcript containing its prompt, command timeline and exit statuses, patched files, final message, and usage details. The run report links to each transcript. Sessions also remain visible in the Codex app, and you can interrogate a worker afterward with:
+**…just telling Codex to do it?** A bare `codex exec` gives you code and a hope. Codex Fleet gives you code plus an independent, adversarial gate: the reviewer trusts only the diff, re-runs the tests itself, and rejects scope creep — and the SHA-keyed merge guard blocks any `codex/*` branch from merging through Claude's tools until that gate has recorded an `approve` for the branch's exact tip. Work that fails verification is parked on its branch, not silently merged.
+
+**…[scasella/claude-dynamic-workflows-codex](https://github.com/scasella/claude-dynamic-workflows-codex)?** That project — whose app-server transport this one vendors, with attribution intact — is a general workflow-DSL runtime for running fleets of Codex workers over research, triage, and brainstorm tasks. Codex Fleet is narrower and git-native: it is a code-**delivery** pipeline. Isolated worktrees per task, mandatory independent verification, adversarial review, SHA-keyed merge gating, and stage-ladder integration that lands a clean diff in your tree. It answers a different question — not "how do I orchestrate Codex workers?" but "how do I let an LLM write code into my repo without trusting a word of it?"
+
+Nobody else in this niche treats the model's output as an untrusted supply chain. That is the whole point.
+
+## Quickstart
+
+Three commands in Claude Code get you from zero to dispatching:
+
+```text
+/plugin marketplace add wenbinio/claudeorchestratortocodex
+/plugin install codex-fleet@wenbinio
+/codex-fleet:setup
+```
+
+Then dispatch work whenever you want:
+
+```text
+/codex-fleet:dispatch
+```
+
+`setup` runs once per machine: it discovers your Codex CLI, verifies non-interactive auth with a trivial READY smoke, probes the runner backend, and writes machine-local config to the plugin data directory (never into the repo). `dispatch` plans the tasks, runs the fleet, records verdicts, and integrates only approved branches.
+
+## Requirements
+
+- Claude Code
+- Codex CLI — installed through the desktop app, or with `npm i -g @openai/codex`
+- A ChatGPT login, or an `OPENAI_API_KEY`
+- Git
+- Node ≥ 18 (optional but recommended — enables the runner and its app-server backend; without it the plugin falls back to Agent-tool orchestration of the same pipeline)
+
+Without any Codex auth at all, the plugin still runs: it falls back to Claude subagents implementing the tasks under the *same* worktree, verification, review, and integration pipeline.
+
+## Architecture at a glance
+
+- **Two skills** — `setup` (once-per-machine bootstrap) and `dispatch` (the orchestrator).
+- **One runner-first lifecycle** (`runner/task-runner.mjs`): worktree → Codex turn(s) → quiescence → verify → one correction round → checked commit → transcript. Two transports sit behind it — **app-server** (sessionful Codex threads over `codex app-server` JSON-RPC; selected when Node ≥ 18 and the probe passes) and **exec** (`codex exec` shelling). The former Workflow-tool engine survives only as `docs/reference/v2-workflow-engine.js`, a historical, non-normative reference.
+- **Two agents** — `codex-driver` (orchestrates and verifies, never edits source itself) and `fleet-reviewer` (adversarial; tools mechanically restricted to no-write; must re-run verify).
+- **One merge-guard hook** (`Bash` + `PowerShell` scripts) — a PreToolUse seatbelt that blocks Claude-tool merges of `codex/*` branches whose tip SHA has no recorded `approve`.
+- **Persistent data-directory state** — `config.json`, `fleet-log.jsonl`, `approved.json`, and per-worker files under `transcripts/`, all outside your repo.
+- **Vendored third-party code** under `vendor/` (see its `NOTICE.md`).
+
+### How work lands: the stage ladder
+
+The default `stage` integration mode is the flagship behavior. Approved branches are applied in verdict order via a temp-commit ladder; the full project verification runs after each application; a red verify parks that branch and rolls back only its own temp commit; and a final `git reset --soft` collapses everything that passed into one staged, uncommitted diff. **No fleet commits remain in your history** — you inspect the diff and commit when you're ready, just like native in-editor work. (`commit` mode leaves per-branch merge commits; `manual` mode integrates nothing and hands you the branches.)
+
+### Observability
+
+Each Codex worker gets a transcript — prompt, command timeline with exit statuses, patched files, final message, and token/duration usage — and the run report links to each one. Workers are non-ephemeral, so sessions also appear in the Codex app, and you can interrogate one afterward:
 
 ```sh
 codex exec resume <sessionId>
 ```
 
-## Install
+## The merge guard
 
-Run these commands in Claude Code:
-
-```text
-/plugin marketplace add wenbinio/claudeorchestratortocodex
-/plugin install codex-fleet@wenbinio
-```
-
-## First run
-
-Run setup once per machine, then dispatch work:
-
-```text
-/codex-fleet:setup
-/codex-fleet:dispatch
-```
-
-## Requirements
-
-- Claude Code
-- Codex CLI, installed through the desktop app or with `npm i -g @openai/codex`
-- A ChatGPT login or an `OPENAI_API_KEY`
-- Git
+The merge guard is an **advisory seatbelt, not a security boundary.** It gates Claude's own shell-tool calls only; it never touches commands you run in your own terminal. It matches `git merge` and `git merge --squash` of `codex/*` branches and checks verdicts keyed to the branch tip SHA. A recorded branch whose tip no longer matches its reviewed SHA is blocked as unreviewed — the branch changed after review. Fail-open is limited to unknown repositories, unknown branches, missing or corrupt state, and guard errors (a guard bug must never brick an unrelated merge). Rebase, cherry-pick, and pull are not matched. The dispatch pipeline's verdict-and-verification protocol is the real enforcement; the guard is a backstop.
 
 ## Cloud sandboxes
 
-Cloud sessions cannot run `/plugin`. Check this exact block into `.claude/settings.json` in every repository that should expose Codex Fleet to claude.ai/code sessions:
+Cloud sessions cannot run `/plugin`. To expose Codex Fleet to claude.ai/code sessions, check this exact block into `.claude/settings.json` in any repository that should have access:
 
 ```json
 {
@@ -54,46 +89,45 @@ Cloud sessions cannot run `/plugin`. Check this exact block into `.claude/settin
 }
 ```
 
-Add `OPENAI_API_KEY` as an environment secret. Skills and agents load in cloud sandboxes, and hooks (including the merge-guard) run in cloud sessions as well, with `CLAUDE_CODE_REMOTE=true` set there — though cloud guard behavior is on the untested-at-release list below. Without a key, the plugin falls back to Claude subagents implementing the tasks under the same worktree, verification, review, and integration pipeline.
-
-## Merge guard
-
-The merge guard is an advisory seatbelt, not a security boundary. It gates Claude's own shell-tool calls only; it never affects commands you run in your terminal. It matches `git merge` and `git merge --squash` of `codex/*` branches and checks verdicts keyed to the branch tip SHA. A recorded branch whose tip no longer matches its reviewed SHA is blocked as unreviewed because the branch changed after review. Fail-open is limited to unknown repositories, unknown branches, missing or corrupt state, and guard errors. Rebase, cherry-pick, and pull are not matched. The dispatch pipeline's verdict and verification protocol is the real enforcement.
+Add `OPENAI_API_KEY` as an environment secret. Skills and agents load in cloud sandboxes, and hooks (including the merge guard) fire in cloud sessions with `CLAUDE_CODE_REMOTE=true` set — though cloud guard behavior is on the untested-at-release list below. Without a key, the plugin uses the Claude-only fallback. Cloud data-directory persistence may require rerunning `setup` per session.
 
 ## Costs
 
-Codex worker usage bills to your OpenAI plan. Fleet runs also consume Claude tokens for planning, driver agents, verification, review, and integration.
+Codex worker usage bills to your OpenAI plan. Fleet runs also consume Claude tokens for planning, the driver and reviewer agents, verification, and integration.
 
-## Release status
+## Limitations & release status
 
-At release, the POSIX driver path, the second-Windows-machine path, and the cloud sandbox surface remain untested by a real run. Those first runs are the validation for those environments; cloud data-directory persistence may require rerunning setup per session.
+Honest about what has and hasn't been exercised by a real run:
 
-## v0.3: runner-first lifecycle
+- **Untested at release:** the POSIX driver path, the second-Windows-machine path, and the cloud sandbox surface (including cloud merge-guard behavior). Those first runs *are* the validation for those environments.
+- The merge guard is advisory and covers only `git merge`/`git merge --squash` of `codex/*` through Claude's tools — rebase, cherry-pick, pull, and your own terminal are outside its scope by design.
+- Codex's sandbox cannot reliably run local toolchains, so **task specs must never ask Codex to run tests** — the driver verifies outside it. This is baked into the spec-writing rules.
+- The `exec` transport passes the prompt as one shell argument; on Windows the command line caps near 32 KB. Real task specs are a few KB so it's latent, but the app-server transport (which sends prompts over JSON-RPC) avoids the ceiling entirely and is preferred when available.
+- Single-provider (Codex / `gpt-5.6-sol`). No Gemini/other-CLI support today.
 
-v0.3 unifies Codex dispatch on one runner-first lifecycle: worktree creation, Codex turns, quiescence, verification, one correction round, checked commit, and transcript generation follow one code path. App-server and `codex exec` are transport choices behind that lifecycle. The former Workflow-tool engine is retained only as [`docs/reference/v2-workflow-engine.js`](docs/reference/v2-workflow-engine.js); it is a historical reference, not a backend or the normative pipeline contract. Stock installations without Node and Claude-only mode continue through the Agent-tool prose fallback.
+## Development
 
-## v0.2: app-server backend
+The runner has a hermetic test suite that needs no real Codex — `test/mock-app-server.mjs` replays a captured app-server wire transcript, and the guard matrix is scripted:
 
-When Node >= 18 is present and the runner's app-server capability probe succeeds, `setup` selects the `app-server` backend; otherwise it records the `exec` transport. Instead of one-shot `codex exec` processes, app-server workers run as sessionful Codex threads over the `codex app-server` JSON-RPC transport: no stdin-close hang, no 10-minute shell-timeout ceiling (the runner owns its own timeouts), and correction rounds are follow-up turns on the same warm thread rather than cold re-prompts. The runner works independently of the in-editor Workflow tool.
-
-Standalone, outside a Claude session:
-
+```sh
+npm test
 ```
+
+CI runs the suite on Ubuntu and Windows (`.github/workflows/ci.yml`).
+
+## Standalone runner
+
+The runner works outside a Claude session. It performs only the *dispatch* phase (worktrees, Codex turns, verify, one correction, checked commit, transcripts) — review and integration remain the dispatch skill's job:
+
+```sh
 node runner/fleet-runner.mjs --batch batch.json
 ```
 
-The batch is `{repo, codexExe, tasks:[{id,spec,verify?}], model?, effort?, timeoutMinutes?}`; it writes `<repo>/.codex-fleet/results.json`. Review and integration remain the dispatch skill's job — the runner performs only the dispatch phase.
+The batch is `{repo, codexExe, backend, tasks:[{id, spec, verify?}], model?, effort?, timeoutMinutes?}`; results are written to the run's external output directory.
 
-The app-server transport and sessionful-worker layer under `vendor/dynamic-workflows-codex/` are **vendored verbatim** from [scasella/claude-dynamic-workflows-codex](https://github.com/scasella/claude-dynamic-workflows-codex) (MIT, © Stephen Casella). Their license and provenance are preserved in [`vendor/dynamic-workflows-codex/LICENSE`](vendor/dynamic-workflows-codex/LICENSE) and [`NOTICE.md`](vendor/dynamic-workflows-codex/NOTICE.md). Node >= 18 is optional but recommended.
+## Attribution
 
-## Architecture
-
-- Two skills: `setup` and `dispatch`
-- One runner-first lifecycle with app-server and `codex exec` transports; `docs/reference/v2-workflow-engine.js` is reference-only
-- Two agents: `codex-driver` and `fleet-reviewer`
-- One merge-guard hook with Windows and POSIX scripts
-- Persistent data-directory files: `config.json`, `fleet-log.jsonl`, `approved.json`, and per-worker files under `transcripts/`
-- Vendored third-party code under `vendor/` (see its `NOTICE.md`)
+The app-server transport and sessionful-worker layer under `vendor/dynamic-workflows-codex/` are **vendored verbatim** from [scasella/claude-dynamic-workflows-codex](https://github.com/scasella/claude-dynamic-workflows-codex) (MIT, © Stephen Casella). Their license and provenance are preserved in [`vendor/dynamic-workflows-codex/LICENSE`](vendor/dynamic-workflows-codex/LICENSE) and [`vendor/dynamic-workflows-codex/NOTICE.md`](vendor/dynamic-workflows-codex/NOTICE.md). Codex Fleet claims no authorship of those files.
 
 ## License
 
