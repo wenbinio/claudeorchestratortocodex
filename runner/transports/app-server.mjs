@@ -250,42 +250,55 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
   if (!cwd) throw new TypeError("createWorker requires cwd");
 
   let driver = null;
+  let driverPromise = null;
   let clientRetained = false;
   let closed = false;
   let broken = false;
   let active = false;
   let lastTurnTimedOut = false;
+  let completionSettled = true;
   let continuationInFlight = false;
 
   async function ensureDriver() {
     if (closed) throw new Error("worker is closed");
     if (broken) throw new Error("worker transport is no longer usable");
     if (driver) return driver;
+    if (driverPromise) return driverPromise;
 
-    beginSessionStart();
-    try {
-      driver = await startCodexSession({
-        cwd,
-        model,
-        sandbox: "workspace-write",
-        systemPrompt: DEVELOPER_INSTRUCTIONS,
-        approvalPolicy: "never", // buildThreadParams enforces this on thread/start.
-        clientOptions: {
-          command: codexExe ?? "codex",
-          // Optional spawn-args override — normal runs use the vendored default
-          // (["app-server", "--listen", "stdio://"]); tests inject a mock server.
-          ...(Array.isArray(codexArgs) && codexArgs.length ? { args: codexArgs } : {}),
+    driverPromise = (async () => {
+      beginSessionStart();
+      try {
+        driver = await startCodexSession({
           cwd,
-          approvalPolicy: "never",
-          requestHandler: denyServerRequest,
-        },
-      });
-    } finally {
-      endSessionStart();
+          model,
+          sandbox: "workspace-write",
+          systemPrompt: DEVELOPER_INSTRUCTIONS,
+          approvalPolicy: "never", // buildThreadParams enforces this on thread/start.
+          clientOptions: {
+            command: codexExe ?? "codex",
+            // Optional spawn-args override — normal runs use the vendored default
+            // (["app-server", "--listen", "stdio://"]); tests inject a mock server.
+            ...(Array.isArray(codexArgs) && codexArgs.length ? { args: codexArgs } : {}),
+            cwd,
+            approvalPolicy: "never",
+            requestHandler: denyServerRequest,
+          },
+        });
+      } finally {
+        endSessionStart();
+      }
+      retainClient(driver.client);
+      clientRetained = true;
+      return driver;
+    })();
+
+    try {
+      return await driverPromise;
+    } catch (error) {
+      driver = null;
+      driverPromise = null;
+      throw error;
     }
-    retainClient(driver.client);
-    clientRetained = true;
-    return driver;
   }
 
   async function forceStop() {
@@ -304,9 +317,8 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
   }
 
   async function runTurn(prompt, { timeoutMs } = {}) {
-    if (active) throw new Error("worker already has an active turn");
     const session = await ensureDriver();
-    active = true;
+    completionSettled = true;
 
     const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
     const deadline = Date.now() + limit;
@@ -370,8 +382,11 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
       const buffered = terminalNotes.find((note) => terminalFor(note, session.threadId, turnId));
       if (buffered) resolveTerminal(buffered);
 
-      let completionSettled = false;
-      handle.completion.finally(() => { completionSettled = true; });
+      completionSettled = false;
+      handle.completion.then(
+        () => { completionSettled = true; },
+        () => { completionSettled = true; },
+      );
       await Promise.resolve();
       if (buffered && !completionSettled) {
         Object.defineProperty(buffered, REPLAYED_TERMINAL, { value: true, configurable: true });
@@ -418,6 +433,17 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
         session.client.emit("notification", terminal);
       }
       const outcomeResult = completed.settled ? completed : await settledWithin(handle.completion, INTERRUPT_GRACE_MS);
+      if (!completionSettled) {
+        await forceStop();
+        return contractResult({
+          status: "interrupted",
+          finalMessage: state.finalMessage || state.latestMessage,
+          commandsRun: state.commandsRun,
+          filesPatched: [...state.filesPatched],
+          tokenUsage: state.tokenUsage,
+          sessionId: session.threadId,
+        }, state.events);
+      }
       const outcome = outcomeResult.value ?? null;
       const rawStatus = terminalRace.note.params?.turn?.status;
       const status = rawStatus === "completed" ? "completed" : rawStatus === "interrupted" ? "interrupted" : "failed";
@@ -449,30 +475,35 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
     } finally {
       session.client.off("notification", onNotification);
       session.client.off("transport", onTransport);
-      active = false;
     }
   }
 
   async function turn(prompt, { timeoutMs } = {}) {
-    const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
-    lastTurnTimedOut = false;
-    const first = await runTurn(prompt, { timeoutMs: limit });
-
-    // Long-turn continuation: a timeout interrupt (never a user interrupt —
-    // close() sets `closed` before interrupting) earns exactly ONE follow-up
-    // turn on the same warm thread. `continuationInFlight` makes looping
-    // structurally impossible even if this wrapper is ever re-entered.
-    if (first.status !== "interrupted" || !lastTurnTimedOut) return first;
-    if (continuationInFlight || closed || broken) return first;
-
-    continuationInFlight = true;
+    if (active) throw new Error("worker already has an active turn");
+    active = true;
     try {
+      const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
       lastTurnTimedOut = false;
-      const continueLimit = Math.max(CONTINUATION_MIN_MS, Math.floor(limit / 2));
-      const followUp = await runTurn("continue", { timeoutMs: continueLimit });
-      return mergeContinuation(first, followUp);
+      const first = await runTurn(prompt, { timeoutMs: limit });
+
+      // Long-turn continuation: a timeout interrupt (never a user interrupt —
+      // close() sets `closed` before interrupting) earns exactly ONE follow-up
+      // turn on the same warm thread. `continuationInFlight` makes looping
+      // structurally impossible even if this wrapper is ever re-entered.
+      if (first.status !== "interrupted" || !lastTurnTimedOut) return first;
+      if (!completionSettled || continuationInFlight || closed || broken) return first;
+
+      continuationInFlight = true;
+      try {
+        lastTurnTimedOut = false;
+        const continueLimit = Math.max(CONTINUATION_MIN_MS, Math.floor(limit / 2));
+        const followUp = await runTurn("continue", { timeoutMs: continueLimit });
+        return mergeContinuation(first, followUp);
+      } finally {
+        continuationInFlight = false;
+      }
     } finally {
-      continuationInFlight = false;
+      active = false;
     }
   }
 
