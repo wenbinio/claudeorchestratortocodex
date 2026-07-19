@@ -174,6 +174,57 @@ async function handle(frame) {
     return;
   }
 
+  if (method === "turn/steer") {
+    const thread = threads.get(params.threadId);
+    if (!thread) {
+      fail(id, -32_602, `unknown thread: ${params.threadId}`);
+      return;
+    }
+
+    const threadId = params.threadId;
+    const turnId = `mock-turn-${++turnSequence}`;
+    const messageId = `mock-message-${++messageSequence}`;
+    const prompt = textFrom(params);
+    let finalText;
+    let status = "completed";
+    let error = null;
+    try {
+      const programResult = await runPromptProgram(prompt, thread.cwd);
+      finalText = programResult === "Mock completed without file changes."
+        ? `Mock applied steer: ${prompt}`
+        : programResult;
+    } catch (caught) {
+      status = "failed";
+      error = { message: caught?.message ?? String(caught) };
+      finalText = `Mock failed: ${error.message}`;
+    }
+
+    activeTurns.set(turnId, { threadId, turnId, messageId, prompt });
+    respond(id, {
+      turn: {
+        id: turnId,
+        items: [],
+        itemsView: "notLoaded",
+        status: "inProgress",
+        error: null,
+      },
+    });
+    notify("item/started", {
+      item: {
+        type: "agentMessage",
+        id: messageId,
+        text: "",
+        phase: "final_answer",
+        memoryCitation: null,
+      },
+      threadId,
+      turnId,
+      startedAtMs: emittedAtMs,
+    });
+    completeTurn({ threadId, turnId, messageId, finalText, status, error, prompt });
+    return;
+  }
+
   if (method === "turn/interrupt") {
     respond(id, {});
     const active = activeTurns.get(params.turnId);
