@@ -313,11 +313,24 @@
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
+  const errorMessage = (error) => error && error.message ? error.message : String(error || "unknown error");
+  function showUnhandledError(error) {
+    const message = "internal error: " + errorMessage(error);
+    pushError("(viewer)", message);
+    const box = $("errors");
+    if (box) box.insertAdjacentHTML("beforeend", '<div class="error-line"><b>(viewer):</b> ' + esc(message) + "</div>");
+  }
+  // Install the guards before wiring controls so startup and async failures are visible.
+  window.addEventListener("error", (event) => showUnhandledError(event.error || event.message));
+  window.addEventListener("unhandledrejection", (event) => showUnhandledError(event.reason));
+
   // ---------- file intake ----------
   const dropzone = $("dropzone");
   const fileInput = $("file-input");
   dropzone.addEventListener("click", () => fileInput.click());
-  dropzone.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") fileInput.click(); });
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+  });
   fileInput.addEventListener("change", () => { ingestFileList(Array.from(fileInput.files)); fileInput.value = ""; });
   ["dragenter", "dragover"].forEach((t) => dropzone.addEventListener(t, (e) => {
     e.preventDefault(); dropzone.classList.add("dragover");
@@ -335,7 +348,7 @@
         if (entry) entries.push(entry);
       }
       collectEntries(entries).then(ingestNamedFiles).catch((err) => {
-        pushError("(drop)", "failed to read dropped items: " + err.message);
+        pushError("(drop)", "failed to read dropped items: " + errorMessage(err));
         render();
       });
     } else if (e.dataTransfer && e.dataTransfer.files.length) {
@@ -347,16 +360,19 @@
     // Recursively walk directory entries -> [{file, relPath}]
     const out = [];
     function walk(entry, prefix) {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         if (entry.isFile) {
-          entry.file((file) => { out.push({ file, relPath: prefix + file.name }); resolve(); }, () => resolve());
+          entry.file(
+            (file) => { out.push({ file, relPath: prefix + file.name }); resolve(); },
+            (error) => reject(new Error("could not read " + (entry.fullPath || entry.name) + ": " + errorMessage(error))),
+          );
         } else if (entry.isDirectory) {
           const reader = entry.createReader();
           const readAll = () => {
             reader.readEntries((batch) => {
               if (!batch.length) { resolve(); return; }
-              Promise.all(batch.map((child) => walk(child, prefix + entry.name + "/"))).then(readAll);
-            }, () => resolve());
+              Promise.all(batch.map((child) => walk(child, prefix + entry.name + "/"))).then(readAll, reject);
+            }, (error) => reject(new Error("could not read " + (entry.fullPath || entry.name) + ": " + errorMessage(error))));
           };
           readAll();
         } else resolve();
@@ -379,7 +395,7 @@
       const reader = new FileReader();
       reader.onload = () => {
         try { classifyAndStore(relPath || file.name, String(reader.result)); }
-        catch (err) { pushError(relPath || file.name, err.message); }
+        catch (err) { pushError(relPath || file.name, errorMessage(err)); }
         if (--pending === 0) render();
       };
       reader.onerror = () => {
@@ -391,7 +407,143 @@
   }
 
   function pushError(fileName, message) {
-    store.errors.push({ fileName, message });
+    store.errors.push({ fileName: String(fileName || "(unknown file)"), message: String(message || "unknown error") });
+  }
+
+  function isObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function requireKeys(value, keys, label) {
+    const missing = keys.filter((key) => !(key in value));
+    if (missing.length) throw new Error(label + " is missing " + missing.join(", "));
+  }
+
+  function validateFleetPayload(payload) {
+    if (!isObject(payload)) throw new Error("results.json must contain an object");
+    const topKeys = ["runId", "results", "approvedBranches", "worktreeBase", "outDir", "complete"];
+    requireKeys(payload, topKeys, "results.json");
+    const unexpected = Object.keys(payload).filter((key) => !topKeys.includes(key));
+    if (unexpected.length) throw new Error("results.json has unexpected top-level field(s): " + unexpected.join(", "));
+    if (typeof payload.runId !== "string" || !payload.runId.trim()) throw new Error("results.json runId must be a non-empty string");
+    if (!Array.isArray(payload.results)) throw new Error("results.json results must be an array");
+    if (!Array.isArray(payload.approvedBranches) || !payload.approvedBranches.every((value) => typeof value === "string")) {
+      throw new Error("results.json approvedBranches must be an array of strings");
+    }
+    if (typeof payload.worktreeBase !== "string" || typeof payload.outDir !== "string") {
+      throw new Error("results.json worktreeBase and outDir must be strings");
+    }
+    if (typeof payload.complete !== "boolean") throw new Error("results.json complete must be a boolean");
+
+    const driverKeys = [
+      "baseSha", "branch", "codexCommandsRun", "codexFinalMessage", "commitSha",
+      "correctionRoundUsed", "diffStat", "filesChanged", "filesPatched", "sessionId",
+      "status", "summary", "transcriptPath", "unverified", "verifyPassed", "verifyTail", "worktree",
+    ];
+    payload.results.forEach((result, index) => {
+      const label = "results.json results[" + index + "]";
+      if (!isObject(result)) throw new Error(label + " must be an object");
+      requireKeys(result, ["taskId", "driver", "review"], label);
+      if (typeof result.taskId !== "string" || !result.taskId.trim()) throw new Error(label + ".taskId must be a non-empty string");
+      if (!isObject(result.driver)) throw new Error(label + ".driver must be an object");
+      requireKeys(result.driver, driverKeys, label + ".driver");
+      const stringFields = [
+        "baseSha", "branch", "codexFinalMessage", "commitSha", "diffStat", "sessionId",
+        "status", "summary", "transcriptPath", "verifyTail", "worktree",
+      ];
+      if (!stringFields.every((key) => typeof result.driver[key] === "string")) {
+        throw new Error(label + ".driver string fields do not match the runner report shape");
+      }
+      const booleanFields = ["correctionRoundUsed", "unverified", "verifyPassed"];
+      if (!booleanFields.every((key) => typeof result.driver[key] === "boolean")) {
+        throw new Error(label + ".driver correctionRoundUsed, unverified, and verifyPassed must be booleans");
+      }
+      if (typeof result.driver.codexCommandsRun !== "number" || !Number.isFinite(result.driver.codexCommandsRun)) {
+        throw new Error(label + ".driver.codexCommandsRun must be a number");
+      }
+      if (!Array.isArray(result.driver.filesChanged) || !Array.isArray(result.driver.filesPatched)) {
+        throw new Error(label + ".driver filesChanged and filesPatched must be arrays");
+      }
+      if (result.review !== null && typeof result.review !== "string" && !isObject(result.review)) {
+        throw new Error(label + ".review must be null, a string, or an object");
+      }
+    });
+  }
+
+  function validateDelegateState(state) {
+    if (!isObject(state)) throw new Error("state.json must contain an object");
+    requireKeys(state, ["threadId", "pid", "status", "lastActivityAt", "turns", "tokens", "verify"], "state.json");
+    if (typeof state.status !== "string" || !state.status) throw new Error("state.json status must be a non-empty string");
+    if (state.threadId !== null && typeof state.threadId !== "string") throw new Error("state.json threadId must be a string or null");
+    if (typeof state.pid !== "number" || typeof state.turns !== "number") throw new Error("state.json pid and turns must be numbers");
+    if (typeof state.lastActivityAt !== "string") throw new Error("state.json lastActivityAt must be a string");
+    if (state.tokens !== null && !isObject(state.tokens)) throw new Error("state.json tokens must be an object or null");
+    if (state.verify !== null && !isObject(state.verify)) throw new Error("state.json verify must be an object or null");
+  }
+
+  function tokenTotal(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (Array.isArray(value)) {
+      let total = 0;
+      let found = false;
+      for (const item of value) {
+        const amount = tokenTotal(item);
+        if (amount != null) { total += amount; found = true; }
+      }
+      return found ? total : null;
+    }
+    if (!isObject(value)) return null;
+    if ("usage" in value) return tokenTotal(value.usage);
+    if (typeof value.totalTokens === "number") return value.totalTokens;
+    if (typeof value.total === "number") return value.total;
+    if (isObject(value.total)) return tokenTotal(value.total);
+    const fields = ["inputTokens", "outputTokens", "reasoningOutputTokens"];
+    if (fields.some((key) => typeof value[key] === "number")) {
+      return fields.reduce((sum, key) => sum + (typeof value[key] === "number" ? value[key] : 0), 0);
+    }
+    return null;
+  }
+
+  function parseTranscript(text) {
+    const headings = ["PROMPT", "TIMELINE", "FINAL MESSAGE", "USAGE", "RESULT"];
+    let from = 0;
+    const positions = {};
+    for (const heading of headings) {
+      const pattern = "^# " + heading.replace(" ", "\\s+") + "\\s*$";
+      const match = new RegExp(pattern, "m").exec(text.slice(from));
+      if (!match) throw new Error("transcript is missing # " + heading);
+      positions[heading] = from + match.index;
+      from = positions[heading] + match[0].length;
+    }
+    const promptSection = text.slice(positions.PROMPT, positions.TIMELINE);
+    if (!/^# PROMPT\s*\r?\n\s*```text\r?\n[\s\S]*\r?\n```\s*$/.test(promptSection)) {
+      throw new Error("transcript # PROMPT is not a complete fenced text block");
+    }
+    for (let index = 1; index < headings.length; index += 1) {
+      const heading = headings[index];
+      const end = index + 1 < headings.length ? positions[headings[index + 1]] : text.length;
+      const body = text.slice(positions[heading], end).replace(/^#[^\r\n]+\r?\n/, "").trim();
+      if (!body) throw new Error("transcript # " + heading + " section is empty");
+    }
+    const usage = text.slice(positions.USAGE, positions.RESULT);
+    for (const field of ["status", "commandsRun", "filesPatched", "tokens", "sessionId", "verifyPassed", "unverified"]) {
+      if (!(new RegExp("^\\s*-\\s*" + field + ":", "mi")).test(usage)) {
+        throw new Error("transcript # USAGE is missing its " + field + " field");
+      }
+    }
+    const tokenLine = usage.match(/^\s*-\s*tokens:\s*(.+)\s*$/mi);
+    if (!tokenLine) throw new Error("transcript # USAGE tokens field has no value");
+    if (tokenLine[1].trim() === "(not reported)") return { tokens: null };
+    let parsed;
+    try { parsed = JSON.parse(tokenLine[1]); }
+    catch (error) { throw new Error("transcript tokens field is invalid JSON: " + errorMessage(error)); }
+    if (!Array.isArray(parsed) || !parsed.length) throw new Error("transcript tokens field must be the non-empty array written by the task runner");
+    for (const entry of parsed) {
+      if (!isObject(entry) || typeof entry.turn !== "string" || !("usage" in entry) || tokenTotal(entry.usage) == null) {
+        throw new Error("transcript tokens field does not match the task runner usage shape");
+      }
+    }
+    return { tokens: tokenTotal(parsed) };
   }
 
   // ---------- classification ----------
@@ -408,22 +560,25 @@
     if (/\.json$/i.test(base) || trimmed[0] === "{") {
       let parsed;
       try { parsed = JSON.parse(trimmed); }
-      catch (err) { throw new Error("invalid JSON: " + err.message); }
-      if (parsed && typeof parsed === "object" && Array.isArray(parsed.results) && "runId" in parsed) {
+      catch (err) { throw new Error("invalid JSON: " + errorMessage(err)); }
+      if (isObject(parsed) && (base.toLowerCase() === "results.json" || "results" in parsed || "runId" in parsed)) {
+        validateFleetPayload(parsed);
         store.fleetRuns.push({ fileName: relPath, payload: parsed });
         return;
       }
-      if (parsed && typeof parsed === "object" && "status" in parsed && ("threadId" in parsed || "pid" in parsed || "turns" in parsed)) {
+      if (isObject(parsed) && (base.toLowerCase() === "state.json" || "status" in parsed)) {
+        validateDelegateState(parsed);
         // Flat picks carry no directory info: group loose state/events into one run.
         const group = delegateGroup(dir || "(loose delegate run)");
         group.state = parsed;
         group.stateFile = relPath;
         return;
       }
-      throw new Error("JSON did not match a known shape (results.json needs runId+results[]; state.json needs status+threadId/pid)");
+      throw new Error("JSON did not match the results.json or delegate state.json shape");
     }
-    if (/\.(md|markdown|txt)$/i.test(base) || /^# (PROMPT|TIMELINE|FINAL MESSAGE|USAGE)$/m.test(trimmed)) {
-      store.transcripts.push({ fileName: relPath, text });
+    if (/\.transcript\.md$/i.test(base) || /^# (PROMPT|TIMELINE|FINAL MESSAGE|USAGE|RESULT)\s*$/m.test(trimmed)) {
+      const metadata = parseTranscript(text);
+      store.transcripts.push({ fileName: relPath, text, tokens: metadata.tokens });
       return;
     }
     throw new Error("unrecognized file type — expected results.json, events.jsonl, state.json, or a transcript .md");
@@ -456,17 +611,19 @@
     const group = delegateGroup(dir || "(loose delegate run)");
     group.eventsFile = relPath;
     const lines = trimmed.split(/\r?\n/);
+    let badLines = 0;
     for (const line of lines) {
       if (!line.trim()) continue;
       try { group.events.push(normalizeEvent(JSON.parse(line))); }
-      catch (_ignored) { group.badLines += 1; }
+      catch (_ignored) { badLines += 1; }
     }
+    group.badLines += badLines;
     if (!group.events.length && !group.state) {
       store.delegates.delete(group.key);
       throw new Error("no parseable JSON lines in " + base);
     }
-    if (group.badLines) {
-      pushError(relPath, group.badLines + " malformed line(s) skipped");
+    if (badLines) {
+      pushError(relPath, badLines + " malformed line(s) skipped");
     }
   }
 
@@ -474,10 +631,10 @@
   // events.jsonl lines are usually already delegate-normalized ({type: ...}),
   // but raw JSON-RPC notifications ({method, params}) are accepted too.
   function normalizeEvent(row) {
-    if (row && typeof row === "object" && typeof row.type === "string") return row;
-    if (row && typeof row === "object" && typeof row.method === "string") {
+    if (isObject(row) && typeof row.type === "string" && row.type) return row;
+    if (isObject(row) && typeof row.method === "string" && row.method) {
       const params = row.params || {};
-      const base = { at: params.at || null, raw: row };
+      const base = { at: params.at || row.at || null, raw: row };
       if (row.method === "item/completed" && params.item) {
         const item = params.item;
         const t = String(item.type || "");
@@ -505,7 +662,7 @@
       if (row.method === "item/started") return { ...base, type: "itemStarted", itemType: params.item && params.item.type };
       return { ...base, type: "notification", method: row.method };
     }
-    return { type: "unknown", raw: row };
+    throw new Error("JSON line is not a delegate event or JSON-RPC notification");
   }
 
   // ---------- card building ----------
@@ -680,7 +837,7 @@
 
   function delegatePills(status, group) {
     const pills = [];
-    if (status) pills.push(pill(status, status === "failed" ? "red" : (status === "done" ? "green" : "amber")));
+    if (status) pills.push(pill(status, status === "failed" ? "red" : (status === "done" || status === "completed" ? "green" : "amber")));
     const verify = latestVerify(group);
     if (verify && verify.ran) pills.push(pill(verify.passed ? "verify ✓" : "verify ✗", verify.passed ? "green" : "red"));
     if (group.state && group.state.turns) pills.push(pill(group.state.turns + " turn(s)", ""));
@@ -717,8 +874,7 @@
       if (d != null) { durationMs += d; sawDuration = true; }
     }
     for (const tr of store.transcripts) {
-      const m = tr.text.match(/^#\s*USAGE\s*$[\s\S]*?total[^\d]*([\d,]+)/mi);
-      if (m) { tokens += Number(m[1].replace(/,/g, "")) || 0; sawTokens = true; }
+      if (tr.tokens != null) { tokens += tr.tokens; sawTokens = true; }
     }
     const stats = [
       stat("tasks", String(cards.length), ""),
@@ -850,6 +1006,7 @@
       ["verifyPassed", String(driver.verifyPassed)],
       ["unverified", String(driver.unverified)],
       ["correctionRoundUsed", String(driver.correctionRoundUsed)],
+      ["codexCommandsRun", driver.codexCommandsRun],
       ["sessionId", driver.sessionId],
       ["transcriptPath", driver.transcriptPath],
       ["summary", driver.summary],
@@ -877,10 +1034,6 @@
     }
     if (driver.diffStat) {
       html += '<div class="section-h">diff stat</div><pre style="white-space:pre-wrap; font-size:11px;">' + esc(driver.diffStat) + "</pre>";
-    }
-    if (Array.isArray(driver.codexCommandsRun) && driver.codexCommandsRun.length) {
-      html += '<div class="section-h">codex commands run (' + driver.codexCommandsRun.length + ")</div><ul>" +
-        driver.codexCommandsRun.map((c) => "<li><code>" + esc(typeof c === "string" ? c : JSON.stringify(c)) + "</code></li>").join("") + "</ul>";
     }
     if (driver.verifyTail) {
       html += '<div class="section-h">verify tail</div><pre style="white-space:pre-wrap; font-size:11px; max-height:300px; overflow:auto;">' + esc(driver.verifyTail) + "</pre>";
@@ -925,7 +1078,7 @@
         return '<div class="ev ev-cmd">' + time + '<span class="ev-tag">cmd</span><div class="ev-body">' + body + "</div></div>";
       }
       case "fileChange": {
-        const changes = Array.isArray(ev.changes) ? ev.changes : [ev.changes];
+        const changes = Array.isArray(ev.changes) ? ev.changes : (ev.changes == null ? [] : [ev.changes]);
         const list = changes.map((c) => {
           if (typeof c === "string") return esc(c);
           if (c && typeof c === "object") return esc((c.kind || c.type || "edit") + " " + (c.path || c.file || JSON.stringify(c)));
@@ -1042,14 +1195,6 @@
     return s.replace(/\n/g, "<br>");
   }
 
-  // last-resort guard: never a blank page
-  window.addEventListener("error", (e) => {
-    try {
-      pushError("(viewer)", "internal error: " + (e.message || "unknown"));
-      $("errors").insertAdjacentHTML("beforeend",
-        '<div class="error-line"><b>(viewer)</b> internal error: ' + esc(e.message || "unknown") + "</div>");
-    } catch (_ignored) { /* nothing left to do */ }
-  });
 })();
 </script>
 </body>
