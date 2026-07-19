@@ -26,6 +26,7 @@ const MOCK_APP_SERVER = path.join(HERE, "mock-app-server.mjs");
 const DRIVER_REPORT_KEYS = [
   "baseSha",
   "branch",
+  "cacheKey",
   "codexCommandsRun",
   "codexFinalMessage",
   "commitSha",

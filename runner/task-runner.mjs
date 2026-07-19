@@ -668,8 +668,10 @@ export async function runTask({
     if (stripped.length) timeline.push(`strip build artifacts: ${stripped.join(", ")}`);
     await requireStagedDiff(worktree, baseCommit);
 
-    const commitMessageLines = [`${branch}: codex-fleet worker`, "", `Codex-Fleet-Task: ${taskId}`];
-    if (report.sessionId) commitMessageLines.push(`Codex-Session: ${report.sessionId}`);
+    const trailerValueRe = /^[A-Za-z0-9._:-]{1,128}$/;
+    const commitMessageLines = [`${branch}: codex-fleet worker`];
+    if (trailerValueRe.test(taskId)) commitMessageLines.push("", `Codex-Fleet-Task: ${taskId}`);
+    if (trailerValueRe.test(report.sessionId)) commitMessageLines.push(`Codex-Session: ${report.sessionId}`);
     await mustGit(["commit", "-m", commitMessageLines.join("\n")], worktree);
     const commitSha = (await mustGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], worktree)).out;
     if (commitSha === baseCommit) {
