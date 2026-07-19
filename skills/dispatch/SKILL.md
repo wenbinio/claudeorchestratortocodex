@@ -109,13 +109,7 @@ Only branches whose current review verdict is `approve` may integrate. Park `nee
 
 ### `stage` (default)
 
-Use the temp-commit ladder and no other stage mechanism:
-
-1. Precondition: the caller's working tree must be clean; if dirty, abort integration with a message. Never stash silently.
-2. Record `ORIG = HEAD`. Per approved branch in verdict order: run `git merge --squash codex/<id>`, then create a TEMP commit `fleet-stage: <id>`, then run FULL project verification.
-3. If verification is red, run `git reset --hard HEAD~1`; this drops only that branch's temp commit while earlier branches remain safe in ancestor temp commits. If the squash conflicts, abort the squash state and run `git reset --hard HEAD`. In either case, park that branch and continue.
-4. After the last branch, run `git reset --soft ORIG`. Every integrated change now appears as one staged, verified, uncommitted diff, and no temp commit remains in history.
-5. Report exactly which branches integrated and which parked, with the reason for each parked branch. Remove the fleet worktrees and delete integrated branches; keep parked branches.
+Use the checked temp-commit ladder and no other stage mechanism. Invoke the absolute `nodeExe` with `${CLAUDE_PLUGIN_ROOT}/scripts/stage-ladder.mjs`, `--repo <repo>`, `--verify <full-project-verify-command>`, and one `--branch codex/<id>` argument per approved branch in verdict order, then read its stdout JSON report. The helper leaves all integrated changes as one staged, verified, uncommitted diff at the original HEAD with no temporary fleet commits in history; it reports integrated and parked branches with reasons, removes integrated worktrees and branches, and keeps parked ones.
 
 This ladder also handles shared-file batches because each squash applies on top of the preceding temp commit.
 
