@@ -70,11 +70,6 @@ async function atomicWriteJson(filePath, value) {
   await atomicWrite(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function appendJsonLine(filePath, value) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.appendFile(filePath, `${JSON.stringify(value)}\n`, "utf8");
-}
-
 async function pathExists(filePath) {
   try {
     await fsp.access(filePath, fsConstants.F_OK);
@@ -233,40 +228,53 @@ async function gitStatus(repo) {
   return result.output.split(/\r?\n/).filter(Boolean);
 }
 
-async function drainInbox(inboxPath) {
-  const processingPath = `${inboxPath}.${process.pid}.${randomUUID()}.processing`;
+async function drainMessageInbox(inboxPath, applyMessage, warn) {
+  let entries;
   try {
-    await fsp.rename(inboxPath, processingPath);
+    entries = await fsp.readdir(inboxPath, { withFileTypes: true });
   } catch (error) {
-    if (error?.code === "ENOENT" || error?.code === "EPERM" || error?.code === "EBUSY") return [];
+    if (error?.code === "ENOENT") return 0;
     throw error;
   }
 
-  try {
-    const contents = await fsp.readFile(processingPath, "utf8");
-    const lines = contents.split(/\r?\n/).filter((line) => line.trim());
-    const messages = [];
-    for (let index = 0; index < lines.length; index += 1) {
-      let parsed = null;
-      try {
-        parsed = JSON.parse(lines[index]);
-      } catch {
-        // The writer (--steer, a separate process) appends without coordination,
-        // so rename can capture a torn, half-written trailing line. Requeue it
-        // for the next drain instead of killing the run; a torn line mid-file
-        // (writer already finished) is genuinely malformed — skip it.
-        if (index === lines.length - 1) {
-          await fsp.appendFile(inboxPath, `${lines[index]}`).catch(() => {});
-        }
-        continue;
-      }
-      if (!parsed || typeof parsed.text !== "string" || !parsed.text.trim()) continue;
-      messages.push(parsed.text);
+  const names = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => entry.name)
+    .sort();
+  let applied = 0;
+  for (const name of names) {
+    const messagePath = path.join(inboxPath, name);
+    const processingPath = `${messagePath}.processing`;
+    try {
+      await fsp.rename(messagePath, processingPath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "EPERM" || error?.code === "EBUSY") continue;
+      throw error;
     }
-    return messages;
-  } finally {
-    await fsp.rm(processingPath, { force: true }).catch(() => {});
+
+    let parsed;
+    try {
+      parsed = JSON.parse(await fsp.readFile(processingPath, "utf8"));
+      if (!parsed || typeof parsed.text !== "string" || !parsed.text.trim()) {
+        throw new Error("steer message needs non-empty text");
+      }
+    } catch (error) {
+      await fsp.rename(processingPath, `${messagePath}.bad`).catch(() => {});
+      await warn({
+        type: "warning",
+        at: new Date().toISOString(),
+        warning: "invalid-steer-message",
+        file: name,
+        error: error?.message ?? String(error),
+      });
+      continue;
+    }
+
+    await applyMessage(parsed.text);
+    await fsp.rm(processingPath, { force: true });
+    applied += 1;
   }
+  return applied;
 }
 
 async function runDelegate(taskPath) {
@@ -275,7 +283,7 @@ async function runDelegate(taskPath) {
   const runDir = path.resolve(cfg.runDir);
   const statePath = path.join(runDir, "state.json");
   const eventsPath = path.join(runDir, "events.jsonl");
-  const inboxPath = path.join(runDir, "steer.inbox.jsonl");
+  const inboxPath = path.join(runDir, "steer.inbox");
   const interruptPath = path.join(runDir, "interrupt.flag");
   const idleTimeoutMs = parseDuration(process.env.DELEGATE_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS);
   const pollMs = parseDuration(process.env.DELEGATE_POLL_MS, DEFAULT_POLL_MS);
@@ -330,20 +338,23 @@ async function runDelegate(taskPath) {
       if (activeTurn) await driver?.interruptCurrent().catch(() => {});
       return { interrupted: true };
     }
-    const messages = await drainInbox(inboxPath);
-    for (const message of messages) {
+    await drainMessageInbox(inboxPath, async (message) => {
       if (activeTurn && typeof driver?.steer === "function") {
+        let steered = false;
         try {
           await driver.steer(message, { effort: cfg.effort });
-          await appendEvent({ type: "steer", at: new Date().toISOString(), mode: "active", text: message, threadId: state.threadId });
-          continue;
+          steered = true;
         } catch {
           // This driver revision may reject active steering; preserve the input as
           // a warm follow-up turn instead of losing it.
         }
+        if (steered) {
+          await appendEvent({ type: "steer", at: new Date().toISOString(), mode: "active", text: message, threadId: state.threadId });
+          return;
+        }
       }
       queuedPrompts.push(message);
-    }
+    }, appendEvent);
     return { interrupted: false };
   };
 
@@ -507,8 +518,15 @@ async function runDelegate(taskPath) {
         await delay(Math.min(pollMs, Math.max(1, idleDeadline - Date.now())));
       }
       if (!stop && !queuedPrompts.length) {
-        finalStatus = "done";
-        stop = true;
+        if (fatalTransport) throw fatalTransport;
+        const control = await consumeControls(false);
+        if (control.interrupted) {
+          finalStatus = "interrupted";
+          stop = true;
+        } else if (!queuedPrompts.length) {
+          finalStatus = "done";
+          stop = true;
+        }
       }
     }
   } catch (error) {
@@ -541,9 +559,23 @@ async function runDelegate(taskPath) {
 async function steer(runDir, text) {
   if (typeof text !== "string" || !text.trim()) throw new CliError("--steer requires non-empty text");
   const resolved = path.resolve(runDir);
-  if (!(await pathExists(path.join(resolved, "state.json")))) throw new CliError(`delegate run not found: ${resolved}`, 1);
+  const statePath = path.join(resolved, "state.json");
+  let state;
+  try {
+    state = JSON.parse(await fsp.readFile(statePath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new CliError(`delegate run not found: ${resolved}`, 1);
+    throw new CliError(`cannot read delegate state: ${error?.message ?? String(error)}`, 1);
+  }
+  if (TERMINAL_STATUSES.has(state?.status)) {
+    process.stdout.write(`${JSON.stringify({ ok: false, reason: `run is ${state.status}` })}\n`);
+    process.exitCode = 3;
+    return;
+  }
   const at = new Date().toISOString();
-  await appendJsonLine(path.join(resolved, "steer.inbox.jsonl"), { text, at });
+  const timestamp = at.replaceAll(":", "-");
+  const messagePath = path.join(resolved, "steer.inbox", `${timestamp}-${randomUUID()}.json`);
+  await atomicWriteJson(messagePath, { text, at });
   process.stdout.write(`${JSON.stringify({ ok: true, action: "steer", runDir: resolved, at })}\n`);
 }
 
