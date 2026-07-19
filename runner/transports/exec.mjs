@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,14 +35,6 @@ function safeOnEvent(onEvent, event) {
   } catch {
     // Event consumers are observational and cannot fail a Codex turn.
   }
-}
-
-function psQuote(value) {
-  return `'${String(value).replaceAll("'", "''")}'`;
-}
-
-function shQuote(value) {
-  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 function normalizedItemType(type) {
@@ -251,27 +244,15 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
     const stderrTail = new TailBuffer(STDERR_TAIL_BYTES);
     const executable = codexExe ?? "codex";
     const isWindows = process.platform === "win32";
-    const command = [executable, ...args].map(isWindows ? psQuote : shQuote).join(" ");
-    const script = isWindows
-      ? stdinFile
-        ? `Get-Content -Raw -LiteralPath ${psQuote(stdinFile)} | & ${command}`
-        : `$null | & ${command}`
-      : stdinFile
-        ? `${command} < ${shQuote(stdinFile)}`
-        : `${command} < /dev/null`;
-    const shell = isWindows ? "powershell.exe" : "/bin/sh";
-    const shellArgs = isWindows
-      ? ["-NoProfile", "-NonInteractive", "-Command", script]
-      : ["-c", script];
 
     let child;
     try {
-      child = spawn(shell, shellArgs, {
+      child = spawn(executable, args, {
         cwd,
         env: { ...process.env, PWD: cwd },
         detached: !isWindows,
         windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
       return { kind: "spawn-error", error };
@@ -279,6 +260,14 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
 
     const exitPromise = waitForExit(child);
     active = { child, exitPromise };
+    child.stdin.on("error", () => {});
+    const stdinStream = stdinFile ? createReadStream(stdinFile) : null;
+    if (stdinStream) {
+      stdinStream.on("error", (error) => child.stdin.destroy(error));
+      stdinStream.pipe(child.stdin);
+    } else {
+      child.stdin.end();
+    }
     let stdoutBuffer = "";
     const acceptStdout = (text, flush = false) => {
       stdoutBuffer += text;
@@ -327,6 +316,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
       return { kind: "exit", code, error, stderrText: stderrTail.text() };
     } finally {
       clearTimeout(timer);
+      stdinStream?.destroy();
     }
   }
 
