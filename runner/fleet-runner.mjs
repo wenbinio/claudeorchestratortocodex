@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -376,19 +376,46 @@ async function branchTip(repo, branch) {
   return "";
 }
 
-async function removeResumeDebris(repo, worktreeBase, taskId, branchExists) {
-  const commands = [
-    ["worktree", "remove", "--force", path.join(worktreeBase, taskId)],
-    ["worktree", "prune"],
-  ];
-  if (branchExists) commands.push(["branch", "-D", `codex/${taskId}`]);
-  for (const command of commands) {
-    try {
-      await runProcess("git", ["-C", repo, ...command], { timeoutMs: GIT_TIMEOUT_MS });
-    } catch {
-      // Best-effort: a survivor resurfaces as a branch collision on the re-run.
+async function inspectResumeWorktree(worktree) {
+  if (!(await pathExists(worktree))) return { exists: false, dirty: false, error: "" };
+  try {
+    const result = await runProcess("git", ["-C", worktree, "status", "--porcelain"], { timeoutMs: GIT_TIMEOUT_MS });
+    if (result.code === 0 && !result.timedOut) {
+      return { exists: true, dirty: Boolean(result.stdout), error: "" };
     }
+    return { exists: true, dirty: false, error: processFailure(result) };
+  } catch (error) {
+    return { exists: true, dirty: false, error: error?.message ?? String(error) };
   }
+}
+
+async function removeResumeWorktree(repo, worktree) {
+  try {
+    const removed = await runProcess("git", ["-C", repo, "worktree", "remove", worktree], { timeoutMs: GIT_TIMEOUT_MS });
+    if (removed.code !== 0 || removed.timedOut) return processFailure(removed);
+    await runProcess("git", ["-C", repo, "worktree", "prune"], { timeoutMs: GIT_TIMEOUT_MS });
+    return "";
+  } catch (error) {
+    return error?.message ?? String(error);
+  }
+}
+
+async function deleteBranchAtTip(repo, branch, expectedTip) {
+  try {
+    const removed = await runProcess(
+      "git",
+      ["-C", repo, "update-ref", "-d", `refs/heads/${branch}`, expectedTip],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    return removed.code === 0 && !removed.timedOut;
+  } catch {
+    return false;
+  }
+}
+
+function taskCacheKey(repoRealpath, baseSha, task, backend, model, effort) {
+  const identity = [repoRealpath, baseSha, task.spec, task.verify || "", backend, model || "", effort || ""];
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
 async function atomicWrite(filePath, contents) {
@@ -453,9 +480,15 @@ function interruptedReport(task, context) {
   return report;
 }
 
-function normalizeReport(report) {
+function blockedReport(task, context) {
+  const report = failedReport(task, context);
+  report.status = "blocked";
+  return report;
+}
+
+function normalizeReport(report, cacheKey) {
   const { taskId, ...driver } = report;
-  return { taskId, driver, review: null };
+  return { taskId, driver: { ...driver, cacheKey }, review: null };
 }
 
 function progress(taskId, state) {
@@ -513,10 +546,11 @@ async function runBatch(args) {
   const reports = new Array(cfg.tasks.length);
   const taskStates = new Array(cfg.tasks.length).fill("pending");
   const activeWorkers = new Map();
+  const cacheKeys = new Map();
 
   const payload = (complete) => ({
     runId,
-    results: reports.filter(Boolean).map(normalizeReport),
+    results: reports.filter(Boolean).map((report) => normalizeReport(report, cacheKeys.get(report.taskId) ?? "")),
     approvedBranches: [],
     worktreeBase,
     outDir,
@@ -566,11 +600,15 @@ async function runBatch(args) {
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
 
-  const cached = new Array(cfg.tasks.length).fill(false);
+  const skipTask = new Array(cfg.tasks.length).fill(false);
 
   try {
     baseSha = await resolveBaseSha(repo);
     if (interruptionRequested) return;
+    const repoRealpath = await fsp.realpath(repo);
+    for (const task of cfg.tasks) {
+      cacheKeys.set(task.id, taskCacheKey(repoRealpath, baseSha, task, cfg.backend, cfg.model, cfg.effort));
+    }
 
     if (args.resume) {
       let prior = null;
@@ -584,23 +622,79 @@ async function runBatch(args) {
       const priorDrivers = new Map();
       for (const entry of prior?.results ?? []) {
         if (entry && typeof entry === "object" && typeof entry.taskId === "string") {
-          priorDrivers.set(entry.taskId, entry.driver ?? null);
+          const drivers = priorDrivers.get(entry.taskId) ?? [];
+          if (entry.driver && typeof entry.driver === "object") drivers.push(entry.driver);
+          priorDrivers.set(entry.taskId, drivers);
         }
       }
       for (let index = 0; index < cfg.tasks.length; index += 1) {
         if (interruptionRequested) return;
         const task = cfg.tasks[index];
-        const tip = await branchTip(repo, `codex/${task.id}`);
-        const priorDriver = priorDrivers.get(task.id);
-        if (priorDriver?.status === "done" && tip && tip === priorDriver.commitSha) {
+        const branch = `codex/${task.id}`;
+        const worktree = path.join(worktreeBase, task.id);
+        const tip = await branchTip(repo, branch);
+        const recordedDrivers = priorDrivers.get(task.id) ?? [];
+        const priorDriver = recordedDrivers.find((driver) => (
+          driver.status === "done"
+          && tip
+          && tip === driver.commitSha
+          && driver.cacheKey === cacheKeys.get(task.id)
+        ));
+        if (priorDriver) {
           reports[index] = { taskId: task.id, ...priorDriver, resumedFromCache: true };
           taskStates[index] = "done";
-          cached[index] = true;
+          skipTask[index] = true;
           progress(task.id, "skipped (cached)");
           continue;
         }
-        if (tip || (await pathExists(path.join(worktreeBase, task.id)))) {
-          await removeResumeDebris(repo, worktreeBase, task.id, Boolean(tip));
+
+        const recordedCommits = new Set(recordedDrivers.map((driver) => driver.commitSha).filter(Boolean));
+        const recognizedTip = Boolean(tip && recordedCommits.has(tip));
+        const worktreeState = await inspectResumeWorktree(worktree);
+        let blockedSummary = tip && !recognizedTip
+          ? `resume: branch ${branch} has unrecognized commits — inspect or delete it manually`
+          : "";
+        if (worktreeState.dirty) {
+          const dirtySummary = `resume: worktree for ${branch} has uncommitted changes — inspect or clean it manually`;
+          blockedSummary = blockedSummary ? `${blockedSummary}; ${dirtySummary}` : dirtySummary;
+        } else if (worktreeState.error) {
+          const statusSummary = `resume: cannot inspect worktree for ${branch} — inspect it manually`;
+          blockedSummary = blockedSummary ? `${blockedSummary}; ${statusSummary}` : statusSummary;
+        }
+
+        if (worktreeState.exists && !worktreeState.dirty && !worktreeState.error) {
+          const removalError = await removeResumeWorktree(repo, worktree);
+          if (removalError) {
+            const removalSummary = `resume: cannot remove worktree for ${branch} — inspect it manually`;
+            blockedSummary = blockedSummary ? `${blockedSummary}; ${removalSummary}` : removalSummary;
+          }
+        }
+
+        if (blockedSummary) {
+          reports[index] = blockedReport(task, { baseSha, worktreeBase, transcriptDir, summary: blockedSummary });
+          taskStates[index] = "blocked";
+          skipTask[index] = true;
+          progress(task.id, "blocked");
+          continue;
+        }
+
+        if (recognizedTip) {
+          const deleted = await deleteBranchAtTip(repo, branch, tip);
+          if (!deleted) {
+            const currentTip = await branchTip(repo, branch);
+            if (currentTip) {
+              const summary = recordedCommits.has(currentTip)
+                ? `resume: branch ${branch} could not be deleted safely — inspect or delete it manually`
+                : `resume: branch ${branch} has unrecognized commits — inspect or delete it manually`;
+              reports[index] = blockedReport(task, { baseSha, worktreeBase, transcriptDir, summary });
+              taskStates[index] = "blocked";
+              skipTask[index] = true;
+              progress(task.id, "blocked");
+              continue;
+            }
+          }
+        }
+        if (tip || worktreeState.exists) {
           progress(task.id, "resume: cleared stale worktree/branch");
         }
       }
@@ -619,7 +713,7 @@ async function runBatch(args) {
     const timeoutMs = cfg.timeoutMinutes == null ? undefined : cfg.timeoutMinutes * 60_000;
     const maxParallel = cfg.maxParallel ?? DEFAULT_MAX_PARALLEL;
     await pool(cfg.tasks, maxParallel, async (task, taskIndex) => {
-      if (cached[taskIndex]) return reports[taskIndex];
+      if (skipTask[taskIndex]) return reports[taskIndex];
       if (interruptionRequested) return reports[taskIndex];
       taskStates[taskIndex] = "running";
       progress(task.id, "start");
