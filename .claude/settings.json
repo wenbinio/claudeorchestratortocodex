@@ -1,0 +1,13 @@
+{
+  "enabledPlugins": {
+    "codex-fleet@wenbinio": true
+  },
+  "extraKnownMarketplaces": {
+    "wenbinio": {
+      "source": {
+        "source": "github",
+        "repo": "wenbinio/claudeorchestratortocodex"
+      }
+    }
+  }
+}
