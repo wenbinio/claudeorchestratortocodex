@@ -6,10 +6,7 @@
   "plugins": [
     {
       "name": "codex-fleet",
-      "source": {
-        "source": "github",
-        "repo": "wenbinio/claudeorchestratortocodex"
-      },
+      "source": "./",
       "description": "Claude-orchestrated Codex coding fleet with isolated worktrees, adversarial verification, worker transcripts, and staged integration."
     }
   ]
