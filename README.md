@@ -33,7 +33,13 @@ Three commands in Claude Code get you from zero to dispatching:
 
 The `/plugin` commands need an **interactive** Claude Code session (or use the desktop app's Plugins browser: Code tab → **+** → Plugins — no terminal needed). If the new skills don't appear immediately after install, run `/reload-plugins` or start a fresh session.
 
-Then dispatch work whenever you want:
+For everyday work, delegate one task live and steer it mid-flight:
+
+```text
+/codex-fleet:delegate refactor the parser to use dataclasses — watch it work, steer it mid-flight
+```
+
+Use dispatch when you want a batch:
 
 ```text
 /codex-fleet:dispatch
@@ -46,6 +52,8 @@ Then dispatch work whenever you want:
 ```
 
 `solo` trades the multi-branch ladder for speed; review stays on by default.
+
+The three tiers are: `delegate` (live, steerable, your tree, you review) / `solo` (isolated, verified, adversarially reviewed) / `dispatch` (parallel batches, full pipeline).
 
 `setup` runs once per machine: it discovers your Codex CLI, verifies non-interactive auth with a trivial READY smoke, probes the runner backend, and writes machine-local config to the plugin data directory (never into the repo). `dispatch` plans the tasks, runs the fleet, records verdicts, and integrates only approved branches.
 
