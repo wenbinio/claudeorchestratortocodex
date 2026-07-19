@@ -244,13 +244,23 @@ async function drainInbox(inboxPath) {
 
   try {
     const contents = await fsp.readFile(processingPath, "utf8");
+    const lines = contents.split(/\r?\n/).filter((line) => line.trim());
     const messages = [];
-    for (const line of contents.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const parsed = JSON.parse(line);
-      if (!parsed || typeof parsed.text !== "string" || !parsed.text.trim()) {
-        throw new Error("steer inbox lines must contain non-empty text");
+    for (let index = 0; index < lines.length; index += 1) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(lines[index]);
+      } catch {
+        // The writer (--steer, a separate process) appends without coordination,
+        // so rename can capture a torn, half-written trailing line. Requeue it
+        // for the next drain instead of killing the run; a torn line mid-file
+        // (writer already finished) is genuinely malformed — skip it.
+        if (index === lines.length - 1) {
+          await fsp.appendFile(inboxPath, `${lines[index]}`).catch(() => {});
+        }
+        continue;
       }
+      if (!parsed || typeof parsed.text !== "string" || !parsed.text.trim()) continue;
       messages.push(parsed.text);
     }
     return messages;
