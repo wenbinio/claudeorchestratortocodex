@@ -244,3 +244,45 @@ export async function writeVerdict(
     return entry;
   });
 }
+
+// --- CLI ---------------------------------------------------------------------
+// node scripts/verdict-store.mjs write --store <approved.json> --repo <repoPath>
+//   --branch codex/<id> --sha <tip-sha> --review-verdict approve|needs_work|reject
+//   --driver-verify-passed true|false --review-verify-passed true|false
+//   [--allow-unverified true|false]
+// Derives the canonical repoKey exactly as the merge-guard does: the repo's
+// git common dir, resolved absolute, forward slashes. Prints the stored entry.
+import { pathToFileURL as __pathToFileURL } from 'node:url';
+if (import.meta.url === __pathToFileURL(process.argv[1] ?? '').href) {
+  const { execFileSync } = await import('node:child_process');
+  const { realpathSync } = await import('node:fs');
+  const argv = process.argv.slice(3);
+  const flags = {};
+  for (let i = 0; i < argv.length; i += 2) flags[argv[i]] = argv[i + 1];
+  const bool = (v, name) => {
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    throw new TypeError(`${name} must be true or false`);
+  };
+  try {
+    if (process.argv[2] !== 'write') throw new TypeError('usage: verdict-store.mjs write --store ... --repo ... --branch ... --sha ... --review-verdict ... --driver-verify-passed ... --review-verify-passed ... [--allow-unverified ...]');
+    const repo = flags['--repo'];
+    if (!repo) throw new TypeError('--repo is required');
+    const common = execFileSync('git', ['-C', repo, 'rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim();
+    const absolute = realpathSync(common.length && !/^([A-Za-z]:[\/]|\/)/.test(common) ? `${repo}/${common}` : common);
+    const repoKey = absolute.split('\\').join('/');
+    const entry = await writeVerdict(flags['--store'], {
+      repoKey,
+      branch: flags['--branch'],
+      sha: flags['--sha'],
+      reviewVerdict: flags['--review-verdict'],
+      driverVerifyPassed: bool(flags['--driver-verify-passed'], '--driver-verify-passed'),
+      reviewVerifyPassed: bool(flags['--review-verify-passed'], '--review-verify-passed'),
+      allowUnverified: flags['--allow-unverified'] === undefined ? false : bool(flags['--allow-unverified'], '--allow-unverified'),
+    });
+    console.log(JSON.stringify({ repoKey, branch: flags['--branch'], entry }, null, 2));
+  } catch (error) {
+    console.error(String(error?.message ?? error));
+    process.exit(1);
+  }
+}

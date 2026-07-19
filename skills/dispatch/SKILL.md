@@ -29,7 +29,7 @@ Inspect the actual repository before drafting any task. Every spec must:
 
 Use the runner-first lifecycle for Codex mode, then converge on the SAME review + verdict-state + integration steps below.
 
-1. **Runner (normative for Codex mode when Node is available).** Use the runner only when `mode === 'codex'`, `codexExe` is an absolute existing file, and `nodeExe` is an absolute existing file. Select its `app-server` transport only when all of those conditions hold **and** setup recorded a current, compatible app-server probe (`config.backend === 'app-server'`); otherwise select the runner's `exec` transport. If the recorded probe is absent, failed, or stale for the current Codex/Node version, re-run setup before considering app-server compatible. Write a batch file to a temp path — `{repo, codexExe, backend, model, effort, tasks, verify, timeoutMinutes}` — then run the whole dispatch phase in ONE command. Invoke the absolute `nodeExe` from config, never bare `node`:
+1. **Runner (normative for Codex mode when Node is available).** Use the runner only when `mode === 'codex'`, `codexExe` is an absolute existing file, and `nodeExe` is an absolute existing file. Select its `app-server` transport only when all of those conditions hold **and** setup recorded a current, compatible app-server probe (`config.backend === 'app-server'`); otherwise select the runner's `exec` transport. If the recorded probe is absent, failed, or stale for the current Codex/Node version, re-run setup before considering app-server compatible. Write a batch file to a temp path — `{repo, codexExe, backend, model, effort, tasks, verify, timeoutMinutes}` — then run the whole dispatch phase in ONE command — **in the background** (`run_in_background`), never foreground: xhigh workers routinely run 3–10 minutes each and a foreground shell tool call times out at 10, orphaning the runner mid-batch. Act on the completion notification. Invoke the absolute `nodeExe` from config, never bare `node`:
 
    ```text
    "<absolute nodeExe>" "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
@@ -87,22 +87,21 @@ The driver's final action must always be StructuredOutput. On failure, interrupt
 
 ## Record verdict state before integration
 
-Do all of the following after the workflow returns and before the first integration command:
+Do all of the following after the run returns and before the first integration command. Never hand-write `approved.json` — the guard requires the derived `eligible` field and a repo key that matches its own canonicalization, and only the verdict-store helper produces both. For each reviewed `codex/<id>` branch, run ONE command:
 
-1. In `repo`, run `git rev-parse --show-toplevel`; trim the output and replace every backslash with `/`. Use only this value as the canonical repository key. Guard comparisons on Windows are case-insensitive.
-2. For each reviewed `codex/<id>` branch, resolve its current tip SHA and create the entry `{"sha": "<tip-sha>", "verdict": "<verdict>"}`.
-3. Read `${dataDir}/approved.json`, or start with `{}` when it does not exist. If an existing file cannot be parsed, do not destroy it and do not begin integration; report the state-write failure.
-4. Perform a read-modify-write merge under the canonical repository key. Preserve every other repository and every unrelated existing branch entry. Never replace the file with a current-run-only object. The resulting schema is:
+```text
+"<absolute nodeExe>" "${CLAUDE_PLUGIN_ROOT}/scripts/verdict-store.mjs" write \
+  --store "${dataDir}/approved.json" \
+  --repo "<repo>" \
+  --branch "codex/<id>" \
+  --sha "<current branch tip sha>" \
+  --review-verdict approve|needs_work|reject \
+  --driver-verify-passed true|false \
+  --review-verify-passed true|false \
+  --allow-unverified true|false
+```
 
-   ```json
-   {
-     "<canonical-repo-key>": {
-       "codex/<id>": {"sha": "<tip-sha>", "verdict": "approve"}
-     }
-   }
-   ```
-
-5. Persist the merged `approved.json` before integration begins. This ordering is mandatory for both ordinary merges and `git merge --squash`.
+The helper derives the canonical repository key exactly as the merge-guard does (the repo's git common dir, resolved absolute, forward slashes), locks the store, performs an atomic read-modify-write that preserves every other repository and branch entry, and computes `eligible` (true only for `approve` with a green reviewer verify, or an opted-in unverified branch with a green driver verify). If the helper reports a corrupt store, do not begin integration; report the state-write failure. Record every reviewed branch BEFORE integration begins — this ordering is mandatory for both ordinary merges and `git merge --squash`.
 
 Only branches whose current review verdict is `approve` may integrate. Park `needs_work`, `reject`, failed, missing-review, and verify-red branches.
 
@@ -136,6 +135,6 @@ After every run, append exactly one JSON line to `${dataDir}/fleet-log.jsonl`:
 {"ts":"<ISO-8601>","repo":"<canonical-repo-key>","taskIds":["<id>"],"verdicts":{},"approvedBranches":["codex/<id>"],"subagentTokens":123}
 ```
 
-Take `subagentTokens` only from the workflow-completion usage report (`subagent_tokens` in the task notification), not from the engine return value. Omit the field when that figure is unavailable; never estimate it. Append the telemetry even when integration is skipped or aborts.
+`subagentTokens` covers only the Claude reviewer/fallback agents you spawned (from their reported usage), not Codex worker tokens — those are in each worker's transcript USAGE section. Omit the field when no agent usage was reported; never estimate it. Append the telemetry even when integration is skipped or aborts.
 
 End with one overview line per worker showing task ID, driver status, review verdict, commands run, files patched, session ID, and a clickable transcript path. Then report the chosen mode, integrated branches, parked branches and reasons, verification outcomes, remaining worktrees/branches, and the telemetry path. If a driver report was lost, label any fields recovered from git state.

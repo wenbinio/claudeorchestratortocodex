@@ -57,7 +57,7 @@ The probe must initialize `codex app-server`, list its models, and complete one 
 
 ## Write configuration
 
-Write `<dataDir>/config.json` with exactly these eight keys and no credentials:
+Write `<dataDir>/config.json` with exactly these ten keys and no credentials — `codexVersion` (from `codexExe --version`) and `nodeVersion` (from `nodeExe --version`) make probe staleness a plain string comparison at dispatch time:
 
 ```json
 {
@@ -68,6 +68,8 @@ Write `<dataDir>/config.json` with exactly these eight keys and no credentials:
   "effort": "xhigh",
   "backend": "app-server",
   "nodeExe": "<absolute node path, or null>",
+  "codexVersion": "<codexExe --version output>",
+  "nodeVersion": "<nodeExe --version output, or null>",
   "verifiedAt": "<ISO-8601 UTC timestamp>"
 }
 ```

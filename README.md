@@ -31,6 +31,8 @@ Three commands in Claude Code get you from zero to dispatching:
 /codex-fleet:setup
 ```
 
+The `/plugin` commands need an **interactive** Claude Code session (or use the desktop app's Plugins browser: Code tab → **+** → Plugins — no terminal needed). If the new skills don't appear immediately after install, run `/reload-plugins` or start a fresh session.
+
 Then dispatch work whenever you want:
 
 ```text
