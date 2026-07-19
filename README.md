@@ -39,6 +39,14 @@ Then dispatch work whenever you want:
 /codex-fleet:dispatch
 ```
 
+### Quick single-task use
+
+```text
+/codex-fleet:solo fix the failing date parse in utils/dates.py
+```
+
+`solo` trades the multi-branch ladder for speed; review stays on by default.
+
 `setup` runs once per machine: it discovers your Codex CLI, verifies non-interactive auth with a trivial READY smoke, probes the runner backend, and writes machine-local config to the plugin data directory (never into the repo). `dispatch` plans the tasks, runs the fleet, records verdicts, and integrates only approved branches.
 
 ## Requirements
