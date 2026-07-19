@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Fleet Run Viewer</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-raise: #161b22;
+    --bg-raise2: #1c2129;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --fg-dim: #8b949e;
+    --fg-faint: #6e7681;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.14);
+    --amber: #d29922;
+    --amber-bg: rgba(210, 153, 34, 0.14);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.14);
+    --blue: #58a6ff;
+    --blue-bg: rgba(88, 166, 255, 0.12);
+    --purple: #bc8cff;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.45;
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-raise);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.4px; }
+  header .sub { color: var(--fg-faint); font-size: 11px; }
+  main { padding: 14px 16px 60px; max-width: 1400px; margin: 0 auto; }
+
+  /* drop zone */
+  #dropzone {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    text-align: center;
+    color: var(--fg-dim);
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+    margin-bottom: 14px;
+  }
+  #dropzone.small { padding: 8px 12px; font-size: 11px; text-align: left; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #dropzone.dragover { border-color: var(--blue); background: var(--blue-bg); color: var(--blue); }
+  #dropzone strong { color: var(--fg); }
+  #dropzone .hint { font-size: 11px; color: var(--fg-faint); margin-top: 6px; }
+  #dropzone.small .hint { margin: 0; }
+  #file-input { display: none; }
+
+  /* errors */
+  #errors { margin: 0 0 12px; display: flex; flex-direction: column; gap: 6px; }
+  .error-line {
+    background: var(--red-bg);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #ffb3ae;
+    word-break: break-word;
+  }
+  .error-line b { color: var(--red); }
+
+  /* summary strip */
+  #summary-strip {
+    display: none;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  #summary-strip.on { display: flex; }
+  .stat {
+    background: var(--bg-raise);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    display: flex;
+    flex-direction: column;
+    min-width: 82px;
+  }
+  .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--fg-faint); }
+  .stat .v { font-size: 15px; font-weight: 600; }
+  .stat .v.green { color: var(--green); }
+  .stat .v.amber { color: var(--amber); }
+  .stat .v.red { color: var(--red); }
+
+  /* card row */
+  #cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .card {
+    background: var(--bg-raise);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--fg-faint);
+    border-radius: 6px;
+    padding: 9px 12px;
+    min-width: 220px;
+    max-width: 340px;
+    flex: 1 1 240px;
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .card:hover { background: var(--bg-raise2); }
+  .card.selected { outline: 1px solid var(--blue); }
+  .card.tone-green { border-left-color: var(--green); }
+  .card.tone-amber { border-left-color: var(--amber); }
+  .card.tone-red { border-left-color: var(--red); }
+  .card .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card .task-id { font-weight: 700; font-size: 13px; word-break: break-all; }
+  .card .kind { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--fg-faint); }
+  .pill {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    margin: 2px 4px 0 0;
+    white-space: nowrap;
+  }
+  .pill.green { background: var(--green-bg); color: var(--green); border-color: rgba(63,185,80,0.4); }
+  .pill.amber { background: var(--amber-bg); color: var(--amber); border-color: rgba(210,153,34,0.4); }
+  .pill.red { background: var(--red-bg); color: var(--red); border-color: rgba(248,81,73,0.4); }
+  .card .meta { margin-top: 5px; font-size: 11px; color: var(--fg-dim); word-break: break-word; }
+  .card .meta .dim { color: var(--fg-faint); }
+
+  /* detail pane */
+  #detail {
+    display: none;
+    background: var(--bg-raise);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  #detail.on { display: block; }
+  #detail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-raise2);
+    flex-wrap: wrap;
+  }
+  #detail-title { font-weight: 700; }
+  #detail-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tab-btn {
+    font: inherit;
+    font-size: 11px;
+    background: transparent;
+    color: var(--fg-dim);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 10px;
+    cursor: pointer;
+  }
+  .tab-btn.active { color: var(--blue); border-color: var(--blue); background: var(--blue-bg); }
+  #detail-close {
+    font: inherit; font-size: 11px; background: transparent; color: var(--fg-dim);
+    border: 1px solid var(--border); border-radius: 5px; padding: 3px 10px; cursor: pointer;
+  }
+  #detail-close:hover { color: var(--red); border-color: var(--red); }
+  #detail-body { padding: 14px 16px; overflow-x: auto; }
+
+  /* rendered markdown */
+  .md h1, .md h2, .md h3, .md h4 {
+    margin: 16px 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+  }
+  .md h1 { font-size: 15px; color: var(--blue); }
+  .md h2 { font-size: 14px; color: var(--purple); }
+  .md h3, .md h4 { font-size: 13px; border-bottom: none; }
+  .md p { margin: 6px 0; }
+  .md ul, .md ol { margin: 6px 0; padding-left: 24px; }
+  .md li { margin: 2px 0; }
+  .md pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    overflow-x: auto;
+    font-size: 12px;
+    margin: 8px 0;
+    white-space: pre;
+  }
+  .md code { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; font-size: 12px; }
+  .md pre code { border: none; padding: 0; background: transparent; }
+
+  /* timeline */
+  .timeline { display: flex; flex-direction: column; gap: 4px; }
+  .ev {
+    display: grid;
+    grid-template-columns: 60px 74px 1fr;
+    gap: 10px;
+    padding: 5px 8px;
+    border-radius: 5px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    align-items: start;
+  }
+  .ev .ev-time { color: var(--fg-faint); font-size: 10px; padding-top: 2px; white-space: nowrap; }
+  .ev .ev-tag {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
+    padding-top: 2px; text-transform: uppercase; white-space: nowrap;
+  }
+  .ev .ev-body { min-width: 0; word-break: break-word; font-size: 12px; }
+  .ev .ev-body pre {
+    background: var(--bg-raise);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin: 4px 0 0;
+    overflow-x: auto;
+    font-size: 11px;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+  }
+  .ev.ev-cmd .ev-tag { color: var(--blue); }
+  .ev.ev-msg .ev-tag { color: var(--purple); }
+  .ev.ev-file .ev-tag { color: var(--amber); }
+  .ev.ev-verify-pass .ev-tag { color: var(--green); }
+  .ev.ev-verify-fail .ev-tag { color: var(--red); }
+  .ev.ev-steer .ev-tag { color: var(--amber); }
+  .ev.ev-turn .ev-tag, .ev.ev-note .ev-tag { color: var(--fg-faint); }
+  .ev.ev-summary { border-color: var(--fg-faint); }
+  .ev.ev-summary .ev-tag { color: var(--fg); }
+  .exit-badge {
+    display: inline-block; font-size: 10px; font-weight: 700;
+    border-radius: 4px; padding: 0 6px; margin-left: 8px; vertical-align: 1px;
+  }
+  .exit-badge.ok { background: var(--green-bg); color: var(--green); }
+  .exit-badge.bad { background: var(--red-bg); color: var(--red); }
+  .exit-badge.na { background: var(--bg-raise2); color: var(--fg-faint); }
+  details { margin-top: 4px; }
+  details summary { cursor: pointer; color: var(--fg-dim); font-size: 11px; user-select: none; }
+  details summary:hover { color: var(--fg); }
+
+  /* key-value blocks in driver detail */
+  .kv { display: grid; grid-template-columns: minmax(140px, max-content) 1fr; gap: 3px 14px; font-size: 12px; }
+  .kv .k { color: var(--fg-faint); white-space: nowrap; }
+  .kv .v { word-break: break-all; }
+  .kv .v.multi { white-space: pre-wrap; }
+  .section-h {
+    margin: 14px 0 6px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--fg-faint); border-bottom: 1px solid var(--border); padding-bottom: 3px;
+  }
+  .section-h:first-child { margin-top: 0; }
+  .empty-note { color: var(--fg-faint); font-style: italic; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CODEX FLEET · RUN VIEWER</h1>
+  <span class="sub">self-contained · no network · drop run artifacts below</span>
+</header>
+<main>
+  <div id="dropzone" tabindex="0" role="button" aria-label="Load run files">
+    <div><strong>Drop files here</strong> or click to pick</div>
+    <div class="hint">accepts any mix of results.json · events.jsonl · state.json · *.transcript.md (folders OK when dragged)</div>
+  </div>
+  <input type="file" id="file-input" multiple>
+  <div id="errors"></div>
+  <div id="summary-strip"></div>
+  <div id="cards"></div>
+  <div id="detail">
+    <div id="detail-head">
+      <span id="detail-title"></span>
+      <div id="detail-tabs"></div>
+      <button id="detail-close" type="button">✕ close</button>
+    </div>
+    <div id="detail-body"></div>
+  </div>
+  <div id="empty-note" class="empty-note">No run data loaded yet. Drop a fleet outDir's results.json, a delegate run directory, or transcript markdown files above.</div>
+</main>
+<script>
+"use strict";
+(function () {
+  // ---------- state ----------
+  const store = {
+    fleetRuns: [],      // parsed results.json payloads: {fileName, payload}
+    delegates: new Map(), // key(dir or synth) -> {key, label, events:[], state:null, eventsFile, stateFile}
+    transcripts: [],    // {fileName, text}
+    errors: [],
+  };
+  let selectedCardId = null;
+  let activeTab = null;
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+  // ---------- file intake ----------
+  const dropzone = $("dropzone");
+  const fileInput = $("file-input");
+  dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") fileInput.click(); });
+  fileInput.addEventListener("change", () => { ingestFileList(Array.from(fileInput.files)); fileInput.value = ""; });
+  ["dragenter", "dragover"].forEach((t) => dropzone.addEventListener(t, (e) => {
+    e.preventDefault(); dropzone.classList.add("dragover");
+  }));
+  ["dragleave", "drop"].forEach((t) => dropzone.addEventListener(t, (e) => {
+    e.preventDefault(); dropzone.classList.remove("dragover");
+  }));
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const items = e.dataTransfer && e.dataTransfer.items;
+    if (items && items.length && typeof items[0].webkitGetAsEntry === "function") {
+      const entries = [];
+      for (const item of items) {
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+      collectEntries(entries).then(ingestNamedFiles).catch((err) => {
+        pushError("(drop)", "failed to read dropped items: " + err.message);
+        render();
+      });
+    } else if (e.dataTransfer && e.dataTransfer.files.length) {
+      ingestFileList(Array.from(e.dataTransfer.files));
+    }
+  });
+
+  function collectEntries(entries) {
+    // Recursively walk directory entries -> [{file, relPath}]
+    const out = [];
+    function walk(entry, prefix) {
+      return new Promise((resolve) => {
+        if (entry.isFile) {
+          entry.file((file) => { out.push({ file, relPath: prefix + file.name }); resolve(); }, () => resolve());
+        } else if (entry.isDirectory) {
+          const reader = entry.createReader();
+          const readAll = () => {
+            reader.readEntries((batch) => {
+              if (!batch.length) { resolve(); return; }
+              Promise.all(batch.map((child) => walk(child, prefix + entry.name + "/"))).then(readAll);
+            }, () => resolve());
+          };
+          readAll();
+        } else resolve();
+      });
+    }
+    return Promise.all(entries.map((entry) => walk(entry, ""))).then(() => out);
+  }
+
+  function ingestFileList(files) {
+    ingestNamedFiles(files.map((file) => ({
+      file,
+      relPath: file.webkitRelativePath || file.name,
+    })));
+  }
+
+  function ingestNamedFiles(namedFiles) {
+    if (!namedFiles.length) return;
+    let pending = namedFiles.length;
+    for (const { file, relPath } of namedFiles) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try { classifyAndStore(relPath || file.name, String(reader.result)); }
+        catch (err) { pushError(relPath || file.name, err.message); }
+        if (--pending === 0) render();
+      };
+      reader.onerror = () => {
+        pushError(relPath || file.name, "could not read file");
+        if (--pending === 0) render();
+      };
+      reader.readAsText(file);
+    }
+  }
+
+  function pushError(fileName, message) {
+    store.errors.push({ fileName, message });
+  }
+
+  // ---------- classification ----------
+  function classifyAndStore(relPath, text) {
+    const base = relPath.split("/").pop() || relPath;
+    const dir = relPath.includes("/") ? relPath.slice(0, relPath.lastIndexOf("/")) : "";
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("file is empty");
+
+    if (/\.jsonl$/i.test(base) || looksLikeJsonl(trimmed)) {
+      storeEventsJsonl(relPath, base, dir, trimmed);
+      return;
+    }
+    if (/\.json$/i.test(base) || trimmed[0] === "{") {
+      let parsed;
+      try { parsed = JSON.parse(trimmed); }
+      catch (err) { throw new Error("invalid JSON: " + err.message); }
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.results) && "runId" in parsed) {
+        store.fleetRuns.push({ fileName: relPath, payload: parsed });
+        return;
+      }
+      if (parsed && typeof parsed === "object" && "status" in parsed && ("threadId" in parsed || "pid" in parsed || "turns" in parsed)) {
+        // Flat picks carry no directory info: group loose state/events into one run.
+        const group = delegateGroup(dir || "(loose delegate run)");
+        group.state = parsed;
+        group.stateFile = relPath;
+        return;
+      }
+      throw new Error("JSON did not match a known shape (results.json needs runId+results[]; state.json needs status+threadId/pid)");
+    }
+    if (/\.(md|markdown|txt)$/i.test(base) || /^# (PROMPT|TIMELINE|FINAL MESSAGE|USAGE)$/m.test(trimmed)) {
+      store.transcripts.push({ fileName: relPath, text });
+      return;
+    }
+    throw new Error("unrecognized file type — expected results.json, events.jsonl, state.json, or a transcript .md");
+  }
+
+  function looksLikeJsonl(trimmed) {
+    // multiple lines, each starting with { — and the whole thing is NOT one valid JSON doc
+    const lines = trimmed.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length < 2) return false;
+    if (!lines.every((l) => l.trim()[0] === "{")) return false;
+    try { JSON.parse(trimmed); return false; } catch (_ignored) { return true; }
+  }
+
+  function delegateGroup(key) {
+    if (!store.delegates.has(key)) {
+      store.delegates.set(key, {
+        key,
+        label: key.split("/").pop() || key,
+        events: [],
+        badLines: 0,
+        state: null,
+        eventsFile: null,
+        stateFile: null,
+      });
+    }
+    return store.delegates.get(key);
+  }
+
+  function storeEventsJsonl(relPath, base, dir, trimmed) {
+    const group = delegateGroup(dir || "(loose delegate run)");
+    group.eventsFile = relPath;
+    const lines = trimmed.split(/\r?\n/);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try { group.events.push(normalizeEvent(JSON.parse(line))); }
+      catch (_ignored) { group.badLines += 1; }
+    }
+    if (!group.events.length && !group.state) {
+      store.delegates.delete(group.key);
+      throw new Error("no parseable JSON lines in " + base);
+    }
+    if (group.badLines) {
+      pushError(relPath, group.badLines + " malformed line(s) skipped");
+    }
+  }
+
+  // ---------- event normalization ----------
+  // events.jsonl lines are usually already delegate-normalized ({type: ...}),
+  // but raw JSON-RPC notifications ({method, params}) are accepted too.
+  function normalizeEvent(row) {
+    if (row && typeof row === "object" && typeof row.type === "string") return row;
+    if (row && typeof row === "object" && typeof row.method === "string") {
+      const params = row.params || {};
+      const base = { at: params.at || null, raw: row };
+      if (row.method === "item/completed" && params.item) {
+        const item = params.item;
+        const t = String(item.type || "");
+        if (t === "agentMessage" || t === "agent_message") {
+          return { ...base, type: "agentMessage", text: item.text || "", status: item.status || "completed" };
+        }
+        if (t === "commandExecution" || t === "command_execution") {
+          return {
+            ...base, type: "commandExecution",
+            command: item.command || item.cmd || "",
+            exitCode: (item.exitCode != null ? item.exitCode : (item.exit_code != null ? item.exit_code : null)),
+            output: item.aggregatedOutput || item.aggregated_output || "",
+            status: item.status || "completed",
+          };
+        }
+        if (t === "fileChange" || t === "file_change") {
+          return { ...base, type: "fileChange", changes: item.changes || item.files || item.paths || (item.path ? [item.path] : []) };
+        }
+        return { ...base, type: "notification", method: row.method };
+      }
+      if (row.method === "thread/tokenUsage/updated") return { ...base, type: "tokenUsage", tokenUsage: params.tokenUsage || null };
+      if (row.method === "turn/completed") {
+        return { ...base, type: "turn", status: (params.turn && params.turn.status) || "failed", error: (params.turn && params.turn.error && params.turn.error.message) || null };
+      }
+      if (row.method === "item/started") return { ...base, type: "itemStarted", itemType: params.item && params.item.type };
+      return { ...base, type: "notification", method: row.method };
+    }
+    return { type: "unknown", raw: row };
+  }
+
+  // ---------- card building ----------
+  function buildCards() {
+    const cards = [];
+    for (const run of store.fleetRuns) {
+      for (const result of run.payload.results || []) {
+        const driver = result.driver || {};
+        cards.push({
+          id: "fleet:" + run.fileName + ":" + result.taskId,
+          kind: "fleet task",
+          title: result.taskId || "(unnamed task)",
+          tone: fleetTone(driver, result.review),
+          pills: fleetPills(driver, result.review),
+          meta: fleetMeta(run, driver),
+          detail: { type: "fleet", run, result },
+        });
+      }
+      if (!(run.payload.results || []).length) {
+        cards.push({
+          id: "fleet:" + run.fileName + ":(empty)",
+          kind: "fleet run",
+          title: run.payload.runId || run.fileName,
+          tone: "amber",
+          pills: [pill("no results", "amber")],
+          meta: "results.json contains an empty results array",
+          detail: { type: "fleet-empty", run },
+        });
+      }
+    }
+    for (const group of store.delegates.values()) {
+      const status = group.state ? group.state.status : lastTurnStatus(group.events);
+      cards.push({
+        id: "delegate:" + group.key,
+        kind: "delegate run",
+        title: group.label === "events.jsonl" || group.label === "state.json" ? (group.key || group.label) : group.label,
+        tone: delegateTone(status, group),
+        pills: delegatePills(status, group),
+        meta: delegateMeta(group),
+        detail: { type: "delegate", group },
+      });
+    }
+    const claimed = new Set();
+    for (const card of cards) {
+      if (card.detail.type !== "fleet") continue;
+      const match = matchTranscript(card.detail.result);
+      if (match) { card.detail.transcript = match; claimed.add(match); }
+    }
+    for (const tr of store.transcripts) {
+      if (claimed.has(tr)) continue;
+      cards.push({
+        id: "transcript:" + tr.fileName,
+        kind: "transcript",
+        title: tr.fileName.split("/").pop(),
+        tone: "",
+        pills: [pill("markdown", "")],
+        meta: (tr.text.length / 1024).toFixed(1) + " KB",
+        detail: { type: "transcript", transcript: tr },
+      });
+    }
+    return cards;
+  }
+
+  function matchTranscript(result) {
+    const driver = result.driver || {};
+    const tp = String(driver.transcriptPath || "").replace(/\\/g, "/");
+    const tpBase = tp.split("/").pop();
+    for (const tr of store.transcripts) {
+      const base = tr.fileName.split("/").pop();
+      if (tpBase && base === tpBase) return tr;
+      if (result.taskId && base.includes(result.taskId) && /transcript/i.test(base)) return tr;
+    }
+    return null;
+  }
+
+  function reviewVerdict(review) {
+    if (review == null) return null;
+    if (typeof review === "string") return review;
+    if (typeof review === "object") return review.verdict || review.reviewVerdict || null;
+    return null;
+  }
+
+  function fleetTone(driver, review) {
+    const verdict = reviewVerdict(review);
+    const status = driver.status;
+    if (status === "failed" || verdict === "reject") return "red";
+    if (status === "done" && driver.unverified !== true && (verdict === null || verdict === "approve")) return "green";
+    return "amber"; // needs_work, unverified, interrupted, blocked, anything else
+  }
+
+  function pill(text, tone) { return { text, tone }; }
+
+  function fleetPills(driver, review) {
+    const pills = [];
+    const statusTone = driver.status === "done" ? "green" : driver.status === "failed" ? "red" : "amber";
+    pills.push(pill(driver.status || "unknown", statusTone));
+    if (driver.verifyPassed === true) pills.push(pill("verify ✓", "green"));
+    else if (driver.verifyPassed === false) pills.push(pill("verify ✗", "red"));
+    if (driver.unverified) pills.push(pill("unverified", "amber"));
+    if (driver.correctionRoundUsed) pills.push(pill("correction round", "amber"));
+    const verdict = reviewVerdict(review);
+    if (verdict) pills.push(pill("review: " + verdict, verdict === "approve" ? "green" : verdict === "reject" ? "red" : "amber"));
+    return pills;
+  }
+
+  function fleetMeta(run, driver) {
+    const bits = [];
+    if (driver.branch) bits.push(driver.branch);
+    if (driver.diffStat) bits.push(String(driver.diffStat).split(/\r?\n/).pop().trim());
+    else if (Array.isArray(driver.filesChanged) && driver.filesChanged.length) bits.push(driver.filesChanged.length + " file(s) changed");
+    bits.push('<span class="dim">run: ' + esc(run.payload.runId || "?") + "</span>");
+    return bits.map((b, i) => (i < bits.length - 1 ? esc(stripTags(b)) : b)).join(" · ");
+  }
+  function stripTags(s) { return String(s); }
+
+  function lastTurnStatus(events) {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      if (events[i].type === "delegate-summary") continue;
+      if (events[i].type === "turn") return events[i].status;
+    }
+    return null;
+  }
+
+  function delegateTone(status, group) {
+    if (status === "failed") return "red";
+    const verify = latestVerify(group);
+    if (verify && verify.ran && verify.passed === false) return "red";
+    if (status === "done" || status === "completed") return "green";
+    if (status === "interrupted" || status === "awaiting-steer" || status === "working" || status === "verifying" || status === "starting") return "amber";
+    return "";
+  }
+
+  function latestVerify(group) {
+    if (group.state && group.state.verify) return group.state.verify;
+    for (let i = group.events.length - 1; i >= 0; i -= 1) {
+      const ev = group.events[i];
+      if (ev.type === "verify") return { ran: true, passed: ev.passed, tail: ev.tail };
+      if (ev.type === "delegate-summary" && ev.verify) return ev.verify;
+    }
+    return null;
+  }
+
+  function delegateTokens(group) {
+    if (group.state && group.state.tokens && typeof group.state.tokens.total === "number") return group.state.tokens.total;
+    for (let i = group.events.length - 1; i >= 0; i -= 1) {
+      const ev = group.events[i];
+      if (ev.type === "tokenUsage") {
+        const tu = ev.tokenUsage;
+        const total = tu && tu.total;
+        if (total && typeof total === "object") {
+          if (typeof total.totalTokens === "number") return total.totalTokens;
+          return (total.inputTokens || 0) + (total.outputTokens || 0) + (total.reasoningOutputTokens || 0);
+        }
+      }
+    }
+    return null;
+  }
+
+  function delegateDurationMs(group) {
+    const stamps = group.events.map((ev) => Date.parse(ev.at)).filter((n) => Number.isFinite(n));
+    if (stamps.length < 2) return null;
+    return Math.max(...stamps) - Math.min(...stamps);
+  }
+
+  function fmtDuration(ms) {
+    if (ms == null) return null;
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    return m + "m " + (s % 60) + "s";
+  }
+
+  function delegatePills(status, group) {
+    const pills = [];
+    if (status) pills.push(pill(status, status === "failed" ? "red" : (status === "done" ? "green" : "amber")));
+    const verify = latestVerify(group);
+    if (verify && verify.ran) pills.push(pill(verify.passed ? "verify ✓" : "verify ✗", verify.passed ? "green" : "red"));
+    if (group.state && group.state.turns) pills.push(pill(group.state.turns + " turn(s)", ""));
+    if (group.events.some((ev) => ev.type === "steer")) pills.push(pill("steered", "amber"));
+    return pills;
+  }
+
+  function delegateMeta(group) {
+    const bits = [];
+    const cmds = group.events.filter((ev) => ev.type === "commandExecution").length;
+    const files = group.events.filter((ev) => ev.type === "fileChange").length;
+    if (cmds) bits.push(cmds + " cmd(s)");
+    if (files) bits.push(files + " file change(s)");
+    const tokens = delegateTokens(group);
+    if (tokens != null) bits.push(tokens.toLocaleString() + " tok");
+    const dur = fmtDuration(delegateDurationMs(group));
+    if (dur) bits.push(dur);
+    return esc(bits.join(" · ") || group.events.length + " event(s)");
+  }
+
+  // ---------- summary strip ----------
+  function buildSummary(cards) {
+    const strip = $("summary-strip");
+    if (!cards.length) { strip.classList.remove("on"); strip.innerHTML = ""; return; }
+    const green = cards.filter((c) => c.tone === "green").length;
+    const amber = cards.filter((c) => c.tone === "amber").length;
+    const red = cards.filter((c) => c.tone === "red").length;
+    let tokens = 0, sawTokens = false;
+    let durationMs = 0, sawDuration = false;
+    for (const group of store.delegates.values()) {
+      const t = delegateTokens(group);
+      if (t != null) { tokens += t; sawTokens = true; }
+      const d = delegateDurationMs(group);
+      if (d != null) { durationMs += d; sawDuration = true; }
+    }
+    for (const tr of store.transcripts) {
+      const m = tr.text.match(/^#\s*USAGE\s*$[\s\S]*?total[^\d]*([\d,]+)/mi);
+      if (m) { tokens += Number(m[1].replace(/,/g, "")) || 0; sawTokens = true; }
+    }
+    const stats = [
+      stat("tasks", String(cards.length), ""),
+      green ? stat("green", String(green), "green") : "",
+      amber ? stat("amber", String(amber), "amber") : "",
+      red ? stat("red", String(red), "red") : "",
+      sawTokens ? stat("tokens", tokens.toLocaleString(), "") : "",
+      sawDuration ? stat("duration", fmtDuration(durationMs), "") : "",
+    ];
+    const incomplete = store.fleetRuns.filter((r) => r.payload.complete === false);
+    if (incomplete.length) stats.push(stat("run state", "INCOMPLETE", "amber"));
+    strip.innerHTML = stats.filter(Boolean).join("");
+    strip.classList.add("on");
+  }
+  function stat(k, v, tone) {
+    return '<div class="stat"><span class="k">' + esc(k) + '</span><span class="v ' + tone + '">' + esc(v) + "</span></div>";
+  }
+
+  // ---------- rendering ----------
+  function render() {
+    const errBox = $("errors");
+    errBox.innerHTML = store.errors.map((e) =>
+      '<div class="error-line"><b>' + esc(e.fileName) + ":</b> " + esc(e.message) + "</div>"
+    ).join("");
+
+    const cards = buildCards();
+    buildSummary(cards);
+
+    const cardsBox = $("cards");
+    cardsBox.innerHTML = cards.map((card) => {
+      const pillsHtml = card.pills.map((p) => '<span class="pill ' + p.tone + '">' + esc(p.text) + "</span>").join("");
+      return '<div class="card tone-' + (card.tone || "none") + (card.id === selectedCardId ? " selected" : "") + '" data-card-id="' + esc(card.id) + '">' +
+        '<div class="card-top"><span class="task-id">' + esc(card.title) + '</span><span class="kind">' + esc(card.kind) + "</span></div>" +
+        "<div>" + pillsHtml + "</div>" +
+        '<div class="meta">' + card.meta + "</div></div>";
+    }).join("");
+    for (const el of cardsBox.querySelectorAll(".card")) {
+      el.addEventListener("click", () => selectCard(el.getAttribute("data-card-id"), cards));
+    }
+
+    $("empty-note").style.display = (cards.length || store.errors.length) ? "none" : "block";
+    if (cards.length) {
+      dropzone.classList.add("small");
+      dropzone.innerHTML = '<strong>+ add more files</strong><span class="hint">results.json · events.jsonl · state.json · *.transcript.md</span>';
+    }
+    if (selectedCardId && !cards.some((c) => c.id === selectedCardId)) closeDetail();
+    else if (selectedCardId) {
+      const card = cards.find((c) => c.id === selectedCardId);
+      if (card) showDetail(card);
+    }
+  }
+
+  function selectCard(id, cards) {
+    const card = cards.find((c) => c.id === id);
+    if (!card) return;
+    selectedCardId = id;
+    activeTab = null;
+    render();
+    $("detail").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function closeDetail() {
+    selectedCardId = null;
+    activeTab = null;
+    $("detail").classList.remove("on");
+    document.querySelectorAll(".card.selected").forEach((el) => el.classList.remove("selected"));
+  }
+  $("detail-close").addEventListener("click", closeDetail);
+
+  function showDetail(card) {
+    const detail = $("detail");
+    detail.classList.add("on");
+    $("detail-title").textContent = card.title + "  ·  " + card.kind;
+    const tabs = detailTabs(card);
+    if (!activeTab || !tabs.some((t) => t.id === activeTab)) activeTab = tabs.length ? tabs[0].id : null;
+    $("detail-tabs").innerHTML = tabs.map((t) =>
+      '<button type="button" class="tab-btn' + (t.id === activeTab ? " active" : "") + '" data-tab="' + esc(t.id) + '">' + esc(t.label) + "</button>"
+    ).join("");
+    for (const btn of $("detail-tabs").querySelectorAll(".tab-btn")) {
+      btn.addEventListener("click", () => { activeTab = btn.getAttribute("data-tab"); showDetail(card); });
+    }
+    const tab = tabs.find((t) => t.id === activeTab);
+    try {
+      $("detail-body").innerHTML = tab ? tab.render() : '<div class="empty-note">nothing to show</div>';
+    } catch (err) {
+      $("detail-body").innerHTML = '<div class="error-line">render error: ' + esc(err.message) + "</div>";
+    }
+  }
+
+  function detailTabs(card) {
+    const d = card.detail;
+    if (d.type === "fleet") {
+      const tabs = [{ id: "driver", label: "driver report", render: () => renderDriver(d.result) }];
+      if (d.transcript) tabs.push({ id: "transcript", label: "transcript", render: () => renderMarkdown(d.transcript.text) });
+      tabs.push({ id: "raw", label: "raw json", render: () => renderRaw(d.result) });
+      return tabs;
+    }
+    if (d.type === "fleet-empty") {
+      return [{ id: "raw", label: "raw json", render: () => renderRaw(d.run.payload) }];
+    }
+    if (d.type === "delegate") {
+      const tabs = [{ id: "timeline", label: "timeline", render: () => renderTimeline(d.group) }];
+      if (d.group.state) tabs.push({ id: "state", label: "state", render: () => renderRaw(d.group.state) });
+      return tabs;
+    }
+    if (d.type === "transcript") {
+      return [
+        { id: "md", label: "rendered", render: () => renderMarkdown(d.transcript.text) },
+        { id: "src", label: "source", render: () => '<pre class="md-src" style="white-space:pre-wrap; font-size:12px; margin:0;">' + esc(d.transcript.text) + "</pre>" },
+      ];
+    }
+    return [];
+  }
+
+  function renderRaw(value) {
+    return '<pre style="white-space:pre-wrap; font-size:12px; margin:0; max-height:70vh; overflow:auto;">' + esc(JSON.stringify(value, null, 2)) + "</pre>";
+  }
+
+  // ---------- driver report detail ----------
+  function renderDriver(result) {
+    const driver = result.driver || {};
+    let html = '<div class="section-h">driver</div><div class="kv">';
+    const rows = [
+      ["status", driver.status],
+      ["branch", driver.branch],
+      ["worktree", driver.worktree],
+      ["baseSha", driver.baseSha],
+      ["commitSha", driver.commitSha],
+      ["verifyPassed", String(driver.verifyPassed)],
+      ["unverified", String(driver.unverified)],
+      ["correctionRoundUsed", String(driver.correctionRoundUsed)],
+      ["sessionId", driver.sessionId],
+      ["transcriptPath", driver.transcriptPath],
+      ["summary", driver.summary],
+    ];
+    for (const [k, v] of rows) {
+      if (v == null || v === "") continue;
+      html += '<span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + "</span>";
+    }
+    html += "</div>";
+
+    const verdict = reviewVerdict(result.review);
+    if (result.review != null) {
+      html += '<div class="section-h">review</div>';
+      if (verdict) html += '<div><span class="pill ' + (verdict === "approve" ? "green" : verdict === "reject" ? "red" : "amber") + '">' + esc(verdict) + "</span></div>";
+      html += renderRaw(result.review);
+    }
+
+    if (Array.isArray(driver.filesChanged) && driver.filesChanged.length) {
+      html += '<div class="section-h">files changed (' + driver.filesChanged.length + ")</div><ul>" +
+        driver.filesChanged.map((f) => "<li>" + esc(typeof f === "string" ? f : JSON.stringify(f)) + "</li>").join("") + "</ul>";
+    }
+    if (Array.isArray(driver.filesPatched) && driver.filesPatched.length) {
+      html += '<div class="section-h">files patched by codex (' + driver.filesPatched.length + ")</div><ul>" +
+        driver.filesPatched.map((f) => "<li>" + esc(typeof f === "string" ? f : JSON.stringify(f)) + "</li>").join("") + "</ul>";
+    }
+    if (driver.diffStat) {
+      html += '<div class="section-h">diff stat</div><pre style="white-space:pre-wrap; font-size:11px;">' + esc(driver.diffStat) + "</pre>";
+    }
+    if (Array.isArray(driver.codexCommandsRun) && driver.codexCommandsRun.length) {
+      html += '<div class="section-h">codex commands run (' + driver.codexCommandsRun.length + ")</div><ul>" +
+        driver.codexCommandsRun.map((c) => "<li><code>" + esc(typeof c === "string" ? c : JSON.stringify(c)) + "</code></li>").join("") + "</ul>";
+    }
+    if (driver.verifyTail) {
+      html += '<div class="section-h">verify tail</div><pre style="white-space:pre-wrap; font-size:11px; max-height:300px; overflow:auto;">' + esc(driver.verifyTail) + "</pre>";
+    }
+    if (driver.codexFinalMessage) {
+      html += '<div class="section-h">codex final message</div><div class="md">' + mdToHtml(driver.codexFinalMessage) + "</div>";
+    }
+    return html || '<div class="empty-note">empty driver report</div>';
+  }
+
+  // ---------- delegate timeline ----------
+  function renderTimeline(group) {
+    const rows = [];
+    for (const ev of group.events) {
+      const row = timelineRow(ev);
+      if (row) rows.push(row);
+    }
+    if (!rows.length) return '<div class="empty-note">no meaningful events in this run</div>';
+    return '<div class="timeline">' + rows.join("") + "</div>";
+  }
+
+  function evTime(ev) {
+    const t = Date.parse(ev.at);
+    if (!Number.isFinite(t)) return "";
+    return new Date(t).toISOString().slice(11, 19);
+  }
+
+  function timelineRow(ev) {
+    const time = '<span class="ev-time">' + esc(evTime(ev)) + "</span>";
+    switch (ev.type) {
+      case "commandExecution": {
+        const code = ev.exitCode;
+        const badge = code === 0
+          ? '<span class="exit-badge ok">exit 0</span>'
+          : code == null
+            ? '<span class="exit-badge na">exit ?</span>'
+            : '<span class="exit-badge bad">exit ' + esc(code) + "</span>";
+        let body = "<code>" + esc(ev.command) + "</code>" + badge;
+        if (ev.output && String(ev.output).trim()) {
+          body += "<details><summary>output</summary><pre>" + esc(String(ev.output).slice(-8000)) + "</pre></details>";
+        }
+        return '<div class="ev ev-cmd">' + time + '<span class="ev-tag">cmd</span><div class="ev-body">' + body + "</div></div>";
+      }
+      case "fileChange": {
+        const changes = Array.isArray(ev.changes) ? ev.changes : [ev.changes];
+        const list = changes.map((c) => {
+          if (typeof c === "string") return esc(c);
+          if (c && typeof c === "object") return esc((c.kind || c.type || "edit") + " " + (c.path || c.file || JSON.stringify(c)));
+          return esc(String(c));
+        }).join("<br>");
+        return '<div class="ev ev-file">' + time + '<span class="ev-tag">files</span><div class="ev-body">' + (list || "(no paths reported)") + "</div></div>";
+      }
+      case "agentMessage": {
+        const text = String(ev.text || "").trim();
+        if (!text) return null;
+        return '<div class="ev ev-msg">' + time + '<span class="ev-tag">agent</span><div class="ev-body md">' + mdToHtml(text) + "</div></div>";
+      }
+      case "verify": {
+        const passed = !!ev.passed;
+        let body = "<code>" + esc(ev.command || "verify") + "</code> — " + (passed ? "PASSED" : "FAILED");
+        if (ev.durationMs != null) body += ' <span class="exit-badge na">' + esc(fmtDuration(ev.durationMs)) + "</span>";
+        if (ev.tail) body += "<details" + (passed ? "" : " open") + "><summary>tail</summary><pre>" + esc(ev.tail) + "</pre></details>";
+        return '<div class="ev ' + (passed ? "ev-verify-pass" : "ev-verify-fail") + '">' + time +
+          '<span class="ev-tag">verify</span><div class="ev-body">' + body + "</div></div>";
+      }
+      case "steer":
+        return '<div class="ev ev-steer">' + time + '<span class="ev-tag">steer</span><div class="ev-body">' + esc(ev.text || "") +
+          (ev.mode ? ' <span class="exit-badge na">' + esc(ev.mode) + "</span>" : "") + "</div></div>";
+      case "turn": {
+        const label = ev.status === "completed" ? "turn completed" : "turn " + (ev.status || "?");
+        return '<div class="ev ev-turn">' + time + '<span class="ev-tag">turn</span><div class="ev-body">' + esc(label) +
+          (ev.error ? " — " + esc(ev.error) : "") + "</div></div>";
+      }
+      case "delegate-summary": {
+        let body = "";
+        const files = Array.isArray(ev.filesChanged) ? ev.filesChanged : [];
+        body += files.length
+          ? files.length + " file(s) in git status:<br>" + files.map((f) => "<code>" + esc(f) + "</code>").join("<br>")
+          : "working tree clean at summary time";
+        if (ev.verify && ev.verify.ran) {
+          body += "<br>verify: " + (ev.verify.passed ? "PASSED" : "FAILED");
+          if (ev.verify.tail && !ev.verify.passed) body += "<details><summary>tail</summary><pre>" + esc(ev.verify.tail) + "</pre></details>";
+        }
+        return '<div class="ev ev-summary">' + time + '<span class="ev-tag">summary</span><div class="ev-body">' + body + "</div></div>";
+      }
+      case "tokenUsage":
+      case "itemStarted":
+        return null; // aggregated in summary strip / noise
+      case "notification":
+        return null; // unmodeled notifications are noise in the timeline
+      default:
+        return '<div class="ev ev-note">' + time + '<span class="ev-tag">' + esc(ev.type || "?") + '</span><div class="ev-body"><details><summary>raw</summary><pre>' +
+          esc(JSON.stringify(ev, null, 2)) + "</pre></details></div></div>";
+    }
+  }
+
+  // ---------- minimal markdown ----------
+  function renderMarkdown(text) {
+    return '<div class="md">' + mdToHtml(text) + "</div>";
+  }
+
+  function mdToHtml(src) {
+    const lines = String(src).replace(/\r\n/g, "\n").split("\n");
+    const out = [];
+    let i = 0;
+    let listType = null; // "ul" | "ol"
+    const closeList = () => { if (listType) { out.push("</" + listType + ">"); listType = null; } };
+    while (i < lines.length) {
+      const line = lines[i];
+      const fence = line.match(/^```(.*)$/);
+      if (fence) {
+        closeList();
+        const code = [];
+        i += 1;
+        while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i += 1; }
+        i += 1; // skip closing fence (or EOF)
+        out.push("<pre><code>" + esc(code.join("\n")) + "</code></pre>");
+        continue;
+      }
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        closeList();
+        const level = Math.min(heading[1].length, 4);
+        out.push("<h" + level + ">" + inlineMd(heading[2]) + "</h" + level + ">");
+        i += 1;
+        continue;
+      }
+      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        const want = ul ? "ul" : "ol";
+        if (listType !== want) { closeList(); out.push("<" + want + ">"); listType = want; }
+        out.push("<li>" + inlineMd((ul || ol)[1]) + "</li>");
+        i += 1;
+        continue;
+      }
+      closeList();
+      if (line.trim() === "") { i += 1; continue; }
+      // paragraph: gather consecutive non-special lines
+      const para = [line];
+      i += 1;
+      while (i < lines.length && lines[i].trim() !== "" &&
+             !/^```/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) &&
+             !/^\s*[-*+]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i])) {
+        para.push(lines[i]);
+        i += 1;
+      }
+      out.push("<p>" + inlineMd(para.join("\n")) + "</p>");
+    }
+    closeList();
+    return out.join("\n");
+  }
+
+  function inlineMd(text) {
+    let s = esc(text);
+    s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
+    return s.replace(/\n/g, "<br>");
+  }
+
+  // last-resort guard: never a blank page
+  window.addEventListener("error", (e) => {
+    try {
+      pushError("(viewer)", "internal error: " + (e.message || "unknown"));
+      $("errors").insertAdjacentHTML("beforeend",
+        '<div class="error-line"><b>(viewer)</b> internal error: ' + esc(e.message || "unknown") + "</div>");
+    } catch (_ignored) { /* nothing left to do */ }
+  });
+})();
+</script>
+</body>
+</html>
