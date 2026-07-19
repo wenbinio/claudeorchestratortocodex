@@ -11,7 +11,8 @@ import { runTask } from "./task-runner.mjs";
 const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 const DEFAULT_MAX_PARALLEL = 4;
 const PROBE_TIMEOUT_MS = 60_000;
-const USAGE = "usage: fleet-runner.mjs --batch <batch.json> | --probe | --cleanup <batch.json> [--delete-branches]";
+const GIT_TIMEOUT_MS = 30_000;
+const USAGE = "usage: fleet-runner.mjs --batch <batch.json> [--resume] | --probe | --cleanup <batch.json> [--delete-branches]";
 const TRANSPORT_URLS = {
   "app-server": new URL("./transports/app-server.mjs", import.meta.url),
   exec: new URL("./transports/exec.mjs", import.meta.url),
@@ -26,7 +27,7 @@ class CliError extends Error {
 }
 
 function parseArgs(argv) {
-  const args = { batch: null, cleanup: null, deleteBranches: false, probe: false };
+  const args = { batch: null, cleanup: null, deleteBranches: false, probe: false, resume: false };
   const valueOptions = new Map([
     ["--batch", "batch"],
     ["--cleanup", "cleanup"],
@@ -47,6 +48,10 @@ function parseArgs(argv) {
       args.deleteBranches = true;
       continue;
     }
+    if (option === "--resume") {
+      args.resume = true;
+      continue;
+    }
     const key = valueOptions.get(option);
     if (!key) throw new CliError(`unknown option: ${option}`);
     if (index + 1 >= argv.length) throw new CliError(`${option} requires a value`);
@@ -57,6 +62,7 @@ function parseArgs(argv) {
   const modes = [Boolean(args.batch), args.probe, Boolean(args.cleanup)].filter(Boolean).length;
   if (modes > 1) throw new CliError("use exactly one of --batch, --probe, or --cleanup");
   if (args.deleteBranches && !args.cleanup) throw new CliError("--delete-branches requires --cleanup");
+  if (args.resume && !args.batch) throw new CliError("--resume requires --batch");
   return args;
 }
 
@@ -194,18 +200,47 @@ async function readBatch(batchPath) {
   }
 }
 
-async function runProcess(command, args) {
+function killProcessTree(child) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.once("error", () => { try { child.kill("SIGKILL"); } catch {} });
+    killer.once("close", (code) => {
+      if (code !== 0) { try { child.kill("SIGKILL"); } catch {} }
+    });
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      try { child.kill("SIGKILL"); } catch {}
+    }
+  }
+}
+
+async function runProcess(command, args, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let timer;
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        killProcessTree(child);
+      }, timeoutMs);
+    }
     child.stdout.on("data", (chunk) => { stdout = (stdout + chunk.toString("utf8")).slice(-64 * 1024); });
     child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString("utf8")).slice(-64 * 1024); });
-    child.once("error", reject);
-    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("close", (code, signal) => { clearTimeout(timer); resolve({ code, signal, stdout, stderr, timedOut }); });
   });
 }
 
@@ -314,16 +349,46 @@ async function cleanupBatch(args) {
 async function resolveBaseSha(repo) {
   let result;
   try {
-    result = await runProcess("git", ["-C", repo, "rev-parse", "HEAD"]);
+    result = await runProcess("git", ["-C", repo, "rev-parse", "HEAD"], { timeoutMs: GIT_TIMEOUT_MS });
   } catch (error) {
     throw new CliError(`cannot resolve baseSha: ${error?.message ?? String(error)}`, 1);
   }
   const baseSha = result.stdout.trim();
+  if (result.timedOut) throw new CliError("cannot resolve baseSha: git rev-parse timed out", 1);
   if (result.code !== 0 || !/^[0-9a-f]{7,64}$/i.test(baseSha)) {
     const detail = result.stderr.trim() || result.stdout.trim() || `git exited ${result.code ?? result.signal ?? "unknown"}`;
     throw new CliError(`cannot resolve baseSha: ${detail}`, 1);
   }
   return baseSha;
+}
+
+async function branchTip(repo, branch) {
+  try {
+    const result = await runProcess(
+      "git",
+      ["-C", repo, "rev-parse", "--verify", `refs/heads/${branch}^{commit}`],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+    if (result.code === 0 && !result.timedOut) return result.stdout.trim();
+  } catch {
+    // Treat an unreadable ref as absent; resume falls back to re-running the task.
+  }
+  return "";
+}
+
+async function removeResumeDebris(repo, worktreeBase, taskId, branchExists) {
+  const commands = [
+    ["worktree", "remove", "--force", path.join(worktreeBase, taskId)],
+    ["worktree", "prune"],
+  ];
+  if (branchExists) commands.push(["branch", "-D", `codex/${taskId}`]);
+  for (const command of commands) {
+    try {
+      await runProcess("git", ["-C", repo, ...command], { timeoutMs: GIT_TIMEOUT_MS });
+    } catch {
+      // Best-effort: a survivor resurfaces as a branch collision on the re-run.
+    }
+  }
 }
 
 async function atomicWrite(filePath, contents) {
@@ -501,8 +566,46 @@ async function runBatch(args) {
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
 
+  const cached = new Array(cfg.tasks.length).fill(false);
+
   try {
     baseSha = await resolveBaseSha(repo);
+    if (interruptionRequested) return;
+
+    if (args.resume) {
+      let prior = null;
+      try {
+        prior = JSON.parse(await fsp.readFile(resultsPath, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          throw new CliError(`cannot read prior results for --resume: ${error?.message ?? String(error)}`, 1);
+        }
+      }
+      const priorDrivers = new Map();
+      for (const entry of prior?.results ?? []) {
+        if (entry && typeof entry === "object" && typeof entry.taskId === "string") {
+          priorDrivers.set(entry.taskId, entry.driver ?? null);
+        }
+      }
+      for (let index = 0; index < cfg.tasks.length; index += 1) {
+        if (interruptionRequested) return;
+        const task = cfg.tasks[index];
+        const tip = await branchTip(repo, `codex/${task.id}`);
+        const priorDriver = priorDrivers.get(task.id);
+        if (priorDriver?.status === "done" && tip && tip === priorDriver.commitSha) {
+          reports[index] = { taskId: task.id, ...priorDriver, resumedFromCache: true };
+          taskStates[index] = "done";
+          cached[index] = true;
+          progress(task.id, "skipped (cached)");
+          continue;
+        }
+        if (tip || (await pathExists(path.join(worktreeBase, task.id)))) {
+          await removeResumeDebris(repo, worktreeBase, task.id, Boolean(tip));
+          progress(task.id, "resume: cleared stale worktree/branch");
+        }
+      }
+    }
+
     if (interruptionRequested) return;
     const transportModule = await import(TRANSPORT_URLS[cfg.backend]);
     if (typeof transportModule.createWorker !== "function") {
@@ -516,6 +619,7 @@ async function runBatch(args) {
     const timeoutMs = cfg.timeoutMinutes == null ? undefined : cfg.timeoutMinutes * 60_000;
     const maxParallel = cfg.maxParallel ?? DEFAULT_MAX_PARALLEL;
     await pool(cfg.tasks, maxParallel, async (task, taskIndex) => {
+      if (cached[taskIndex]) return reports[taskIndex];
       if (interruptionRequested) return reports[taskIndex];
       taskStates[taskIndex] = "running";
       progress(task.id, "start");

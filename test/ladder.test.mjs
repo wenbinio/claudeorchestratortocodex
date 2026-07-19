@@ -85,3 +85,46 @@ test("stage ladder keeps verified changes staged and parks a red branch", async 
     true,
   );
 });
+
+test("--skip-reverify-single integrates a lone branch without running verify", async (t) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-ladder-skip-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const repo = path.join(tempRoot, "repo");
+  await mkdir(repo, { recursive: true });
+  await git(repo, "init");
+  await git(repo, "config", "user.name", "Codex Fleet Ladder Test");
+  await git(repo, "config", "user.email", "codex-fleet-ladder@example.invalid");
+  await writeFile(path.join(repo, "base.txt"), "base\n", "utf8");
+  await git(repo, "add", "--", "base.txt");
+  await git(repo, "commit", "-m", "base");
+
+  const baseBranch = (await git(repo, "branch", "--show-current")).stdout.trim();
+  const origSha = (await git(repo, "rev-parse", "HEAD")).stdout.trim();
+
+  await commitFile(repo, "codex/solo", "solo.txt", "solo\n");
+  await git(repo, "checkout", baseBranch);
+
+  // Verify command fails loudly on every platform; it must never be invoked.
+  const outcome = await run(process.execPath, [
+    LADDER,
+    "--repo", repo,
+    "--verify", "exit 1",
+    "--skip-reverify-single",
+    "--branch", "codex/solo",
+  ], { cwd: repo });
+  const report = JSON.parse(outcome.stdout);
+
+  assert.deepEqual(report.integrated, ["codex/solo"]);
+  assert.deepEqual(report.parked, []);
+  assert.equal(report.reverifySkipped, true);
+  assert.equal(report.origSha, origSha);
+  assert.deepEqual(report.finalStagedFiles, ["solo.txt"]);
+
+  assert.equal((await git(repo, "rev-parse", "HEAD")).stdout.trim(), origSha);
+  assert.deepEqual(
+    (await git(repo, "diff", "--cached", "--name-only", "-z", "--")).stdout.split("\0").filter(Boolean),
+    ["solo.txt"],
+  );
+  await assert.rejects(git(repo, "show-ref", "--verify", "refs/heads/codex/solo"));
+});

@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const KILL_GRACE_MS = 2_000;
+const CONTINUATION_MIN_MS = 120_000;
 const STDERR_TAIL_BYTES = 64 * 1024;
 
 class TailBuffer {
@@ -239,22 +244,21 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
   let active = null;
   let closed = false;
 
-  async function turn(prompt, { timeoutMs } = {}) {
-    if (closed) throw new Error("worker is closed");
-    if (active) throw new Error("worker already has an active turn");
-
-    const state = makeState(onEvent);
+  // Runs one codex exec process to completion (or timeout-kill). Frames are
+  // collected into the shared per-turn state so a continuation run accumulates
+  // onto the same commandsRun/filesPatched/events ledger.
+  async function runOnce(state, { args, stdinFile, limit }) {
     const stderrTail = new TailBuffer(STDERR_TAIL_BYTES);
-    const args = ["exec", "--json", "--sandbox", "workspace-write"];
-    if (model) args.push("-m", String(model));
-    if (effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(String(effort))}`);
-    args.push(String(prompt));
-
     const executable = codexExe ?? "codex";
     const isWindows = process.platform === "win32";
+    const command = [executable, ...args].map(isWindows ? psQuote : shQuote).join(" ");
     const script = isWindows
-      ? `$null | & ${[executable, ...args].map(psQuote).join(" ")}`
-      : `${[executable, ...args].map(shQuote).join(" ")} < /dev/null`;
+      ? stdinFile
+        ? `Get-Content -Raw -LiteralPath ${psQuote(stdinFile)} | & ${command}`
+        : `$null | & ${command}`
+      : stdinFile
+        ? `${command} < ${shQuote(stdinFile)}`
+        : `${command} < /dev/null`;
     const shell = isWindows ? "powershell.exe" : "/bin/sh";
     const shellArgs = isWindows
       ? ["-NoProfile", "-NonInteractive", "-Command", script]
@@ -270,8 +274,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
-      recordEvent(state, { type: "turn", status: "failed", error: error?.message ?? String(error) });
-      return contractResult({ status: "failed" }, state.events);
+      return { kind: "spawn-error", error };
     }
 
     const exitPromise = waitForExit(child);
@@ -303,7 +306,6 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
     child.stdout?.on("data", (chunk) => acceptStdout(chunk.toString("utf8")));
     child.stderr?.on("data", (chunk) => stderrTail.push(chunk));
 
-    const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
     let timer;
     try {
       const outcome = await Promise.race([
@@ -317,6 +319,55 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         if (!stopped) throw new Error("timed-out codex exec process tree did not terminate");
         await exitPromise;
         acceptStdout("", true);
+        return { kind: "timeout" };
+      }
+
+      acceptStdout("", true);
+      const { code, error } = outcome.value;
+      return { kind: "exit", code, error, stderrText: stderrTail.text() };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function turn(prompt, { timeoutMs } = {}) {
+    if (closed) throw new Error("worker is closed");
+    if (active) throw new Error("worker already has an active turn");
+
+    const state = makeState(onEvent);
+    const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
+    const flagArgs = ["--json", "--sandbox", "workspace-write"];
+    if (model) flagArgs.push("-m", String(model));
+    if (effort) flagArgs.push("-c", `model_reasoning_effort=${JSON.stringify(String(effort))}`);
+    // Windows caps command lines near 32KB, so the prompt travels by file →
+    // stdin ("codex exec -" reads instructions from stdin) instead of argv.
+    const promptFile = path.join(os.tmpdir(), `codex-fleet-prompt-${process.pid}-${randomUUID()}.txt`);
+
+    try {
+      await fsp.writeFile(promptFile, String(prompt), "utf8");
+      let outcome = await runOnce(state, { args: ["exec", ...flagArgs, "-"], stdinFile: promptFile, limit });
+
+      // Long-turn continuation: a timeout interrupt (the only interrupt source
+      // here) earns exactly ONE `codex exec resume <sessionId> continue` with
+      // half the original window (min 2 minutes). No captured sessionId → skip.
+      // Structurally loop-free: the resume outcome is never continued again.
+      if (outcome.kind === "timeout" && state.sessionId && !closed) {
+        const continueLimit = Math.max(CONTINUATION_MIN_MS, Math.floor(limit / 2));
+        state.terminalStatus = null;
+        recordEvent(state, { type: "turn", sessionId: state.sessionId, status: "continuing", reason: "timeout" });
+        outcome = await runOnce(state, {
+          args: ["exec", "resume", ...flagArgs, String(state.sessionId), "continue"],
+          stdinFile: null,
+          limit: continueLimit,
+        });
+      }
+
+      if (outcome.kind === "spawn-error") {
+        recordEvent(state, { type: "turn", status: "failed", error: outcome.error?.message ?? String(outcome.error) });
+        return contractResult({ status: "failed" }, state.events);
+      }
+
+      if (outcome.kind === "timeout") {
         return contractResult({
           status: "interrupted",
           finalMessage: state.finalMessage || state.latestMessage,
@@ -327,8 +378,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         }, state.events);
       }
 
-      acceptStdout("", true);
-      const { code, error } = outcome.value;
+      const { code, error, stderrText } = outcome;
       if (error) {
         recordEvent(state, { type: "turn", sessionId: state.sessionId, status: "failed", error: error.message });
       } else if (code !== 0 && !state.terminalStatus) {
@@ -336,7 +386,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
           type: "turn",
           sessionId: state.sessionId,
           status: "failed",
-          error: stderrTail.text().trim() || `codex exec exited ${code}`,
+          error: stderrText.trim() || `codex exec exited ${code}`,
         });
       }
 
@@ -365,8 +415,8 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         sessionId: state.sessionId,
       }, state.events);
     } finally {
-      clearTimeout(timer);
       active = null;
+      await fsp.rm(promptFile, { force: true }).catch(() => {});
     }
   }
 

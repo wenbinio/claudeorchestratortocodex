@@ -668,7 +668,9 @@ export async function runTask({
     if (stripped.length) timeline.push(`strip build artifacts: ${stripped.join(", ")}`);
     await requireStagedDiff(worktree, baseCommit);
 
-    await mustGit(["commit", "-m", `${branch}: codex-fleet worker`], worktree);
+    const commitMessageLines = [`${branch}: codex-fleet worker`, "", `Codex-Fleet-Task: ${taskId}`];
+    if (report.sessionId) commitMessageLines.push(`Codex-Session: ${report.sessionId}`);
+    await mustGit(["commit", "-m", commitMessageLines.join("\n")], worktree);
     const commitSha = (await mustGit(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], worktree)).out;
     if (commitSha === baseCommit) {
       throw new RunnerInvariantError("commit-equals-base", "commit did not advance beyond baseSha");

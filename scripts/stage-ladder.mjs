@@ -112,10 +112,14 @@ async function mustGit(args, cwd) {
 }
 
 function parseArgs(argv) {
-  const options = { repo: "", verify: "", branches: [] };
+  const options = { repo: "", verify: "", branches: [], skipReverifySingle: false };
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
+    if (flag === "--skip-reverify-single") {
+      options.skipReverifySingle = true;
+      continue;
+    }
     if (!["--repo", "--verify", "--branch"].includes(flag)) {
       throw new TypeError(`unknown argument: ${flag}`);
     }
@@ -207,7 +211,7 @@ async function deleteIntegratedBranches(repo, branches) {
   }
 }
 
-async function runLadder({ repo, verify, branches }, report) {
+async function runLadder({ repo, verify, branches, skipReverifySingle }, report) {
   const inside = await mustGit(["rev-parse", "--is-inside-work-tree"], repo);
   if (inside.out !== "true") throw new Error(`not a git worktree: ${repo}`);
   repo = path.resolve((await mustGit(["rev-parse", "--show-toplevel"], repo)).out);
@@ -246,13 +250,18 @@ async function runLadder({ repo, verify, branches }, report) {
       const id = branch.slice("codex/".length);
       await mustGit(["commit", "--no-gpg-sign", "-m", `fleet-stage: ${id}`], repo);
       const tempSha = (await mustGit(["rev-parse", "--verify", "HEAD^{commit}"], repo)).out;
-      const verification = await runVerify(verify, repo);
-      await assertHead(repo, tempSha);
 
-      if (verification.code !== 0 || verification.signal) {
-        await mustGit(["reset", "--hard", "HEAD~1"], repo);
-        report.parked.push({ branch, reason: verificationReason(verification) });
-        continue;
+      if (skipReverifySingle && branches.length === 1) {
+        report.reverifySkipped = true;
+      } else {
+        const verification = await runVerify(verify, repo);
+        await assertHead(repo, tempSha);
+
+        if (verification.code !== 0 || verification.signal) {
+          await mustGit(["reset", "--hard", "HEAD~1"], repo);
+          report.parked.push({ branch, reason: verificationReason(verification) });
+          continue;
+        }
       }
 
       expectedHead = tempSha;
@@ -278,6 +287,7 @@ async function runLadder({ repo, verify, branches }, report) {
       }
       report.integrated = [];
       report.finalStagedFiles = [];
+      report.reverifySkipped = false;
     }
   }
 }
@@ -287,6 +297,7 @@ const report = {
   parked: [],
   origSha: null,
   finalStagedFiles: [],
+  reverifySkipped: false,
 };
 
 try {

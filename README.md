@@ -78,7 +78,7 @@ Without any Codex auth at all, the plugin still runs: it falls back to Claude su
 
 ### How work lands: the stage ladder
 
-The default `stage` integration mode is the flagship behavior. Approved branches are applied in verdict order via a temp-commit ladder; the full project verification runs after each application; a red verify parks that branch and rolls back only its own temp commit; and a final `git reset --soft` collapses everything that passed into one staged, uncommitted diff. **No fleet commits remain in your history** — you inspect the diff and commit when you're ready, just like native in-editor work. (`commit` mode leaves per-branch merge commits; `manual` mode integrates nothing and hands you the branches.)
+The default `stage` integration mode is the flagship behavior. Approved branches are applied in verdict order via a temp-commit ladder; the full project verification runs after each application; a red verify parks that branch and rolls back only its own temp commit; and a final `git reset --soft` collapses everything that passed into one staged, uncommitted diff. (`--skip-reverify-single` skips the redundant post-application verify when exactly one approved branch is staged; multi-branch ladders always re-verify every rung.) **No fleet commits remain in your history** — you inspect the diff and commit when you're ready, just like native in-editor work. (`commit` mode leaves per-branch merge commits; `manual` mode integrates nothing and hands you the branches.)
 
 ### Observability
 
@@ -87,6 +87,8 @@ Each Codex worker gets a transcript — prompt, command timeline with exit statu
 ```sh
 codex exec resume <sessionId>
 ```
+
+Every fleet commit also carries `Codex-Fleet-Task:` and `Codex-Session:` trailers, so the fleet log and your git history form a traceable audit trail in both directions.
 
 ## The merge guard
 
@@ -120,7 +122,7 @@ Honest about what has and hasn't been exercised by a real run:
 - **Untested at release:** the POSIX driver path, the second-Windows-machine path, and the cloud sandbox surface (including cloud merge-guard behavior). Those first runs *are* the validation for those environments.
 - The merge guard is advisory and covers only `git merge`/`git merge --squash` of `codex/*` through Claude's tools — rebase, cherry-pick, pull, and your own terminal are outside its scope by design.
 - Codex's sandbox cannot reliably run local toolchains, so **task specs must never ask Codex to run tests** — the driver verifies outside it. This is baked into the spec-writing rules.
-- The `exec` transport passes the prompt as one shell argument; on Windows the command line caps near 32 KB. Real task specs are a few KB so it's latent, but the app-server transport (which sends prompts over JSON-RPC) avoids the ceiling entirely and is preferred when available.
+- The `exec` transport feeds the prompt via stdin/temp file (v0.4.1), so the Windows ~32 KB command-line cap no longer applies; the app-server transport sends prompts over JSON-RPC and is preferred when available.
 - Single-provider (Codex / `gpt-5.6-sol`). No Gemini/other-CLI support today.
 
 ## Development
@@ -154,8 +156,9 @@ Vendored code under `vendor/` retains its own upstream MIT license and copyright
 
 ## Runner CLI modes
 
-The standalone runner (`node runner/fleet-runner.mjs`) has three modes:
+The standalone runner (`node runner/fleet-runner.mjs`) has four modes:
 
 - `--batch <batch.json>` — run a fleet batch. Prints one `[fleet] <task> <state>` progress line per task transition on stderr, and rewrites `results.json` atomically after each task completes (`complete: false` until the run ends), so an interrupted run always leaves salvageable state. Ctrl-C interrupts active workers cleanly and records unfinished tasks as `interrupted`.
+- `--resume <batch.json>` — re-run a batch, skipping tasks already `done` whose branch tip still matches the recorded commit; stale worktrees/branches of non-done tasks are cleaned before re-dispatch.
 - `--probe` — verify the app-server backend end-to-end (initialize, model list, one ephemeral read-only turn); used by `setup`.
 - `--cleanup <batch.json>` — remove the batch's worktrees (`--delete-branches` additionally deletes unmerged `codex/*` branches). Prints a JSON summary.

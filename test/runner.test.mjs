@@ -237,6 +237,94 @@ test("fleet runner is hermetic, externalizes state, commits, and blocks collisio
   assert.equal((await git(repo, "branch", "--list", "codex/*")).stdout.trim(), "");
 });
 
+test("fleet runner --resume skips done tasks whose branch tip matches the cached commit", { timeout: 120_000 }, async (t) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-resume-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const repo = path.join(tempRoot, "repo");
+  const wtBase = path.join(tempRoot, "worktrees");
+  const outDir = path.join(tempRoot, "run-output");
+  await mkdir(repo, { recursive: true });
+
+  await writeFile(
+    path.join(repo, "fixture.test.mjs"),
+    [
+      'import assert from "node:assert/strict";',
+      'import { readFile } from "node:fs/promises";',
+      'import test from "node:test";',
+      "",
+      'test("solution has been repaired", async () => {',
+      '  assert.equal(await readFile(new URL("./solution.txt", import.meta.url), "utf8"), "fixed\\n");',
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const { codexExe, codexArgs } = configureMockExecutable();
+  await git(repo, "init");
+  await git(repo, "config", "user.name", "Codex Fleet Test");
+  await git(repo, "config", "user.email", "codex-fleet-test@example.invalid");
+  await git(repo, "add", "--", ".");
+  await git(repo, "commit", "-m", "failing fixture");
+
+  const batchPath = path.join(tempRoot, "batch.json");
+  const nodeQuoted = JSON.stringify(process.execPath);
+  const verify = process.platform === "win32"
+    ? `& ${nodeQuoted} --test fixture.test.mjs`
+    : `${nodeQuoted} --test fixture.test.mjs`;
+  await writeFile(batchPath, JSON.stringify({
+    repo: await realpath(repo),
+    codexExe,
+    codexArgs,
+    backend: "app-server",
+    runId: "resume-test",
+    outDir,
+    wtBase,
+    maxParallel: 1,
+    timeoutMinutes: 1,
+    tasks: [{
+      id: "repair",
+      spec: [
+        "Repair the failing fixture by applying this deterministic mock program:",
+        "```mock-file solution.txt",
+        "fixed",
+        "```",
+      ].join("\n"),
+      verify,
+    }],
+  }, null, 2), "utf8");
+
+  const first = await run(process.execPath, [FLEET_RUNNER, "--batch", batchPath], {
+    cwd: ROOT,
+    timeout: 75_000,
+  });
+  assert.match(first.stderr, /\[fleet\] repair done/);
+  const resultsPath = path.join(outDir, "results.json");
+  const firstPayload = JSON.parse(await readFile(resultsPath, "utf8"));
+  const firstDriver = firstPayload.results.find((report) => report.taskId === "repair").driver;
+  assert.equal(firstDriver.status, "done");
+  assert.equal(firstDriver.resumedFromCache, undefined);
+
+  const startedAt = Date.now();
+  const resumed = await run(process.execPath, [FLEET_RUNNER, "--batch", batchPath, "--resume"], {
+    cwd: ROOT,
+    timeout: 30_000,
+  });
+  const resumeMs = Date.now() - startedAt;
+  assert.match(resumed.stderr, /\[fleet\] repair skipped \(cached\)/);
+  assert.doesNotMatch(resumed.stderr, /\[fleet\] repair start/);
+  assert.match(resumed.stdout, /fleet-runner: 1\/1 done/);
+
+  const resumedPayload = JSON.parse(await readFile(resultsPath, "utf8"));
+  assert.equal(resumedPayload.complete, true);
+  const resumedReport = resumedPayload.results.find((report) => report.taskId === "repair");
+  assert.equal(resumedReport.driver.resumedFromCache, true);
+  assert.equal(resumedReport.driver.status, "done");
+  assert.equal(resumedReport.driver.commitSha, firstDriver.commitSha);
+  assert.ok(resumeMs < 20_000, `resume with a fully cached task should be fast, took ${resumeMs}ms`);
+});
+
 test("fleet runner interrupts workers and preserves a partial result", {
   skip: process.platform === "win32" ? "Windows does not deliver child.kill(SIGINT) to a Node signal handler" : false,
   timeout: 45_000,
