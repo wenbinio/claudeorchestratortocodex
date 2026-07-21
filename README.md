@@ -90,6 +90,10 @@ codex exec resume <sessionId>
 
 Every fleet commit also carries `Codex-Fleet-Task:` and `Codex-Session:` trailers, so the fleet log and your git history form a traceable audit trail in both directions.
 
+### MCP surface
+
+The plugin ships a zero-dependency Node ≥ 18 MCP server that loads automatically, including in cloud sandboxes. Its six tools list fleet runs (`fleet_runs`), summarize one run (`fleet_run`), read a task transcript (`fleet_transcript`), show delegate state and recent event beats (`delegate_status`), queue steering (`delegate_steer`), and request interruption (`delegate_interrupt`). The server touches only the local plugin data directory and needs no credentials.
+
 ## The merge guard
 
 The merge guard is an **advisory seatbelt, not a security boundary.** It gates Claude's own shell-tool calls only; it never touches commands you run in your own terminal. It matches `git merge` and `git merge --squash` of `codex/*` branches and checks verdicts keyed to the branch tip SHA. A recorded branch whose tip no longer matches its reviewed SHA is blocked as unreviewed — the branch changed after review. Fail-open is limited to unknown repositories, unknown branches, missing or corrupt state, and guard errors (a guard bug must never brick an unrelated merge). Rebase, cherry-pick, and pull are not matched. The dispatch pipeline's verdict-and-verification protocol is the real enforcement; the guard is a backstop.
