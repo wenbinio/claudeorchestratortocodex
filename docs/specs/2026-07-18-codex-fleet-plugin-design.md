@@ -319,3 +319,8 @@ One pass through the logged deferrals (A9 "out of scope" + A10 Wave 1 follow-ups
 6. **Stage-ladder `--skip-reverify-single`** (verify-cost fix). When exactly one approved branch is being staged, the ladder's post-application full verify duplicates the reviewer's just-recorded green run on an identical tree; the flag skips that single redundant pass. Multi-branch ladders always re-verify every rung.
 
 **Process honesty:** this round was built by parallel Claude agents under a 20-minute timebox with the test suite as the gate — no adversarial-review layer ran over the diffs. The suite passing is the whole warrant; treat these changes with correspondingly calibrated trust. `plugin.json` → `0.4.1`.
+
+## Field lessons — 2026-07-19 (mid-session Codex app update)
+
+- **Windows discovery order:** the updated Codex app (0.145.0-alpha.27) no longer exposes a parseable `CODEX_CLI_PATH` in `config.toml`; recovery required scanning `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\` directly. Setup should promote the bin-dir scan (pick the dir whose codex.exe runs and reports the newest version) from fallback to co-primary.
+- **Resume debris edge:** a branch created by a failed dispatch that died BEFORE any commit sits at exactly the base SHA. The hardened A9/Wave-R rule (delete only on recorded-commit match) correctly refuses to touch it, but such a branch provably contains no work; `--resume` should auto-clear branches whose tip equals the batch baseSha. Until then the manual path is: verify `git rev-list --count main..codex/<id>` is 0, then delete.
