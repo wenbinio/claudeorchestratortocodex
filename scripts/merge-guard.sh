@@ -199,8 +199,12 @@ reset_command_segment() {
 
 run_nested_tokenizer() {
     nested_text=$1
-    parent_validate_only=$validate_only
     (
+        # MUST be assigned INSIDE the subshell: at nesting depth >= 2 the inner
+        # call would otherwise execute this line in the OUTER subshell and
+        # clobber its parent_validate_only, making the outer scan exit before
+        # its real pass -- a silent bypass for doubly-nested shell wrappers.
+        parent_validate_only=$validate_only
         token_depth=$((token_depth + 1))
         [ "$token_depth" -le 4 ] || exit 0
 

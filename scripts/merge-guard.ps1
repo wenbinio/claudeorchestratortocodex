@@ -366,7 +366,9 @@ function Get-MergeInvocationsFromTokens {
             continue
         }
 
-        if ($token -in @('-m', '--message', '-F', '--file', '-s', '--strategy', '-X',
+        # -cin (case-SENSITIVE): plain -in would let git's real -S (gpg-sign)
+        # match -s (strategy) and consume the branch name as its value.
+        if ($token -cin @('-m', '--message', '-F', '--file', '-s', '--strategy', '-X',
                 '--strategy-option', '--cleanup', '--into-name')) {
             $expectValue = $true
             $index++
