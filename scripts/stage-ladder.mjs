@@ -2,8 +2,11 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 const OUTPUT_LIMIT = 4 * 1024 * 1024;
+const DEFAULT_VERIFY_TIMEOUT_MS = 15 * 60_000;
+const PROCESS_KILL_GRACE_MS = 2_000;
 const BRANCH_PATTERN = /^codex\/[A-Za-z0-9._/-]+$/;
 
 class TailBuffer {
@@ -49,42 +52,129 @@ class HeadMovedError extends Error {
   }
 }
 
-function runProcess(command, args, { cwd, outputLimit = OUTPUT_LIMIT } = {}) {
+function waitForExit(child) {
   return new Promise((resolve) => {
-    const stdout = new TailBuffer(outputLimit);
-    const stderr = new TailBuffer(outputLimit);
-    let child;
     let settled = false;
-
-    const finish = (result) => {
+    const finish = (value) => {
       if (settled) return;
       settled = true;
-      resolve({
-        ...result,
-        stdout: stdout.text(),
-        stderr: stderr.text(),
-        stdoutTruncated: stdout.truncated,
-        stderrTruncated: stderr.truncated,
-      });
+      resolve(value);
     };
-
-    try {
-      child = spawn(command, args, {
-        cwd,
-        env: { ...process.env, ...(cwd ? { PWD: cwd } : {}) },
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      finish({ code: null, signal: null, error });
-      return;
-    }
-
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.once("error", (error) => finish({ code: null, signal: null, error }));
     child.once("close", (code, signal) => finish({ code, signal, error: null }));
   });
+}
+
+async function runTaskkill(pid) {
+  return new Promise((resolve) => {
+    const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    killer.once("error", () => resolve(false));
+    killer.once("close", (code) => resolve(code === 0));
+  });
+}
+
+async function killProcessTree(child, exitPromise) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return true;
+
+  if (process.platform === "win32") {
+    await runTaskkill(child.pid);
+  } else {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try { child.kill("SIGTERM"); } catch {}
+    }
+  }
+
+  let stopped = await Promise.race([
+    exitPromise.then(() => true),
+    delay(PROCESS_KILL_GRACE_MS).then(() => false),
+  ]);
+  if (stopped) return true;
+
+  if (process.platform === "win32") {
+    await runTaskkill(child.pid);
+    try { child.kill("SIGKILL"); } catch {}
+  } else {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+  }
+  stopped = await Promise.race([
+    exitPromise.then(() => true),
+    delay(PROCESS_KILL_GRACE_MS).then(() => false),
+  ]);
+  return stopped;
+}
+
+async function runProcess(command, args, {
+  cwd,
+  timeoutMs,
+  outputLimit = OUTPUT_LIMIT,
+} = {}) {
+  const stdout = new TailBuffer(outputLimit);
+  const stderr = new TailBuffer(outputLimit);
+  const detached = process.platform !== "win32";
+  let child;
+
+  try {
+    child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...(cwd ? { PWD: cwd } : {}) },
+      detached,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    return {
+      code: null,
+      signal: null,
+      error,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    };
+  }
+
+  child.stdout?.on("data", (chunk) => stdout.push(chunk));
+  child.stderr?.on("data", (chunk) => stderr.push(chunk));
+  const exitPromise = waitForExit(child);
+  let timer;
+  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : null;
+  const outcome = limit
+    ? await Promise.race([
+      exitPromise.then((value) => ({ kind: "exit", value })),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ kind: "timeout" }), limit); }),
+    ])
+    : { kind: "exit", value: await exitPromise };
+  clearTimeout(timer);
+
+  let timedOut = false;
+  let exit = outcome.value;
+  if (outcome.kind === "timeout") {
+    timedOut = true;
+    const stopped = await killProcessTree(child, exitPromise);
+    if (!stopped) {
+      const error = new Error(`process tree did not terminate: ${command}`);
+      error.name = "ProcessTreeTerminationError";
+      throw error;
+    }
+    exit = await exitPromise;
+  }
+
+  return {
+    code: exit.code,
+    signal: exit.signal,
+    error: exit.error,
+    timedOut,
+    stdout: stdout.text(),
+    stderr: stderr.text(),
+    stdoutTruncated: stdout.truncated,
+    stderrTruncated: stderr.truncated,
+  };
 }
 
 async function rawGit(args, cwd) {
@@ -112,7 +202,14 @@ async function mustGit(args, cwd) {
 }
 
 function parseArgs(argv) {
-  const options = { repo: "", verify: "", branches: [], skipReverifySingle: false };
+  const options = {
+    repo: "",
+    verify: "",
+    verifyTimeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
+    branches: [],
+    skipReverifySingle: false,
+  };
+  let verifyTimeoutSpecified = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -120,7 +217,7 @@ function parseArgs(argv) {
       options.skipReverifySingle = true;
       continue;
     }
-    if (!["--repo", "--verify", "--branch"].includes(flag)) {
+    if (!["--repo", "--verify", "--verify-timeout-ms", "--branch"].includes(flag)) {
       throw new TypeError(`unknown argument: ${flag}`);
     }
     const value = argv[index + 1];
@@ -134,6 +231,16 @@ function parseArgs(argv) {
     } else if (flag === "--verify") {
       if (options.verify) throw new TypeError("--verify may be specified only once");
       options.verify = value;
+    } else if (flag === "--verify-timeout-ms") {
+      if (verifyTimeoutSpecified) {
+        throw new TypeError("--verify-timeout-ms may be specified only once");
+      }
+      const parsed = Number(value);
+      if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new TypeError("--verify-timeout-ms requires a positive integer");
+      }
+      options.verifyTimeoutMs = parsed;
+      verifyTimeoutSpecified = true;
     } else {
       options.branches.push(value);
     }
@@ -163,12 +270,15 @@ async function assertHead(repo, expected) {
   if (actual !== expected) throw new HeadMovedError(expected, actual);
 }
 
-async function runVerify(command, cwd) {
-  const shell = process.platform === "win32" ? "powershell.exe" : "sh";
-  const args = process.platform === "win32"
-    ? ["-NoProfile", "-Command", command]
+async function runVerify(command, cwd, timeoutMs) {
+  const isWindows = process.platform === "win32";
+  // Keep this verify shell invocation in lockstep across worker and ladder gates:
+  // one user string must have identical semantics in both.
+  const shell = isWindows ? "powershell.exe" : "/bin/sh";
+  const args = isWindows
+    ? ["-NoProfile", "-NonInteractive", "-Command", command]
     : ["-c", command];
-  const result = await runProcess(shell, args, { cwd });
+  const result = await runProcess(shell, args, { cwd, timeoutMs });
   if (result.error) {
     throw new Error(`could not start verification shell: ${result.error.message}`);
   }
@@ -176,6 +286,7 @@ async function runVerify(command, cwd) {
 }
 
 function verificationReason(result) {
+  if (result.timedOut) return "verify timed out";
   const status = result.signal
     ? `signal ${result.signal}`
     : `exit ${result.code ?? "unknown"}`;
@@ -211,7 +322,13 @@ async function deleteIntegratedBranches(repo, branches) {
   }
 }
 
-async function runLadder({ repo, verify, branches, skipReverifySingle }, report) {
+async function runLadder({
+  repo,
+  verify,
+  verifyTimeoutMs,
+  branches,
+  skipReverifySingle,
+}, report) {
   const inside = await mustGit(["rev-parse", "--is-inside-work-tree"], repo);
   if (inside.out !== "true") throw new Error(`not a git worktree: ${repo}`);
   repo = path.resolve((await mustGit(["rev-parse", "--show-toplevel"], repo)).out);
@@ -254,10 +371,10 @@ async function runLadder({ repo, verify, branches, skipReverifySingle }, report)
       if (skipReverifySingle && branches.length === 1) {
         report.reverifySkipped = true;
       } else {
-        const verification = await runVerify(verify, repo);
+        const verification = await runVerify(verify, repo, verifyTimeoutMs);
         await assertHead(repo, tempSha);
 
-        if (verification.code !== 0 || verification.signal) {
+        if (verification.timedOut || verification.code !== 0 || verification.signal) {
           await mustGit(["reset", "--hard", "HEAD~1"], repo);
           report.parked.push({ branch, reason: verificationReason(verification) });
           continue;
