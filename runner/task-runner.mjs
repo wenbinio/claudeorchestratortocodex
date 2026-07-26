@@ -322,6 +322,8 @@ async function disposeSnapshot(snapshot) {
 
 async function runVerify(command, cwd, timeoutMs) {
   const isWindows = process.platform === "win32";
+  // Keep this verify shell invocation in lockstep across worker and ladder gates:
+  // one user string must have identical semantics in both.
   const shell = isWindows ? "powershell.exe" : "/bin/sh";
   const args = isWindows
     ? ["-NoProfile", "-NonInteractive", "-Command", command]

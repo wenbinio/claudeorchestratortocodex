@@ -32,6 +32,29 @@ async function commitFile(repo, branch, file, contents) {
   await git(repo, "commit", "-m", branch);
 }
 
+test("--verify-timeout-ms rejects non-positive values before repository access", async () => {
+  await assert.rejects(
+    run(process.execPath, [
+      LADDER,
+      "--repo", ".",
+      "--verify", "exit 0",
+      "--verify-timeout-ms", "0",
+      "--branch", "codex/good",
+    ]),
+    (error) => {
+      assert.match(error.stderr, /--verify-timeout-ms requires a positive integer/);
+      assert.deepEqual(JSON.parse(error.stdout), {
+        integrated: [],
+        parked: [],
+        origSha: null,
+        finalStagedFiles: [],
+        reverifySkipped: false,
+      });
+      return true;
+    },
+  );
+});
+
 test("stage ladder keeps verified changes staged and parks a red branch", async (t) => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-ladder-"));
   t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
@@ -84,6 +107,58 @@ test("stage ladder keeps verified changes staged and parks a red branch", async 
     (await git(repo, "show-ref", "--verify", "refs/heads/codex/bad")).stdout.trim().endsWith(" refs/heads/codex/bad"),
     true,
   );
+});
+
+test("stage ladder parks a timed-out rung and continues", { timeout: 30_000 }, async (t) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-fleet-ladder-timeout-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const repo = path.join(tempRoot, "repo");
+  await mkdir(repo, { recursive: true });
+  await git(repo, "init");
+  await git(repo, "config", "user.name", "Codex Fleet Ladder Test");
+  await git(repo, "config", "user.email", "codex-fleet-ladder@example.invalid");
+  await writeFile(path.join(repo, "base.txt"), "base\n", "utf8");
+  await git(repo, "add", "--", "base.txt");
+  await git(repo, "commit", "-m", "base");
+
+  const baseBranch = (await git(repo, "branch", "--show-current")).stdout.trim();
+  const origSha = (await git(repo, "rev-parse", "HEAD")).stdout.trim();
+
+  await commitFile(repo, "codex/slow", "slow.txt", "slow\n");
+  await git(repo, "checkout", baseBranch);
+  await commitFile(repo, "codex/good", "good.txt", "good\n");
+  await git(repo, "checkout", baseBranch);
+
+  const verify = process.platform === "win32"
+    ? "if (Test-Path -LiteralPath 'slow.txt') { Start-Sleep -Seconds 30 }"
+    : "if [ -e slow.txt ]; then sleep 30; fi";
+  const outcome = await run(process.execPath, [
+    LADDER,
+    "--repo", repo,
+    "--verify", verify,
+    "--verify-timeout-ms", "1500",
+    "--branch", "codex/slow",
+    "--branch", "codex/good",
+  ], { cwd: repo });
+  const report = JSON.parse(outcome.stdout);
+
+  assert.deepEqual(report.integrated, ["codex/good"]);
+  assert.deepEqual(report.parked, [{ branch: "codex/slow", reason: "verify timed out" }]);
+  assert.equal(report.origSha, origSha);
+  assert.deepEqual(report.finalStagedFiles, ["good.txt"]);
+
+  assert.equal((await git(repo, "rev-parse", "HEAD")).stdout.trim(), origSha);
+  assert.deepEqual(
+    (await git(repo, "diff", "--cached", "--name-only", "-z", "--")).stdout.split("\0").filter(Boolean),
+    ["good.txt"],
+  );
+  assert.equal(
+    (await git(repo, "show-ref", "--verify", "refs/heads/codex/slow")).stdout.trim()
+      .endsWith(" refs/heads/codex/slow"),
+    true,
+  );
+  await assert.rejects(git(repo, "show-ref", "--verify", "refs/heads/codex/good"));
 });
 
 test("--skip-reverify-single integrates a lone branch without running verify", async (t) => {
