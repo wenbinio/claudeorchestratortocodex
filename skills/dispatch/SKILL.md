@@ -35,17 +35,11 @@ Use the runner-first lifecycle for Codex mode, then converge on the SAME review 
    "<absolute nodeExe>" "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
    ```
 
-   After the runner exits, delete the temporary batch file in a `finally` cleanup (the runner has already read it); remove it on both success and failure. Read the runner's `results.json` payload, then normalize every flat driver result **before spawning any reviewer** with this exact conversion:
+   After the runner exits, delete the temporary batch file (the runner has already read it) — but write it inside `outDir` so `--cleanup` can still find it later. Read the runner's `results.json` payload.
 
-   ```javascript
-   const results = runnerPayload.results.map(({ taskId, ...driver }) => ({
-     taskId,
-     driver,
-     review: null
-   }));
-   ```
+   **Do NOT re-shape the results.** The runner already emits the canonical form — each entry is `{taskId, driver: {...}, review: null}`. Re-mapping it (for example with `results.map(({taskId, ...driver}) => ...)`) nests `driver` inside itself and makes every field — `status`, `branch`, `verifyPassed` — read as `undefined`. Consume the entries exactly as written.
 
-   This moves every runner field other than `taskId` under `driver` without renaming or dropping fields. Spawn one reviewer for each reviewable normalized entry, then replace that entry's `review: null` with the reviewer's structured result. Recompute `approvedBranches` from the completed canonical entries; do not trust the runner's initially empty `approvedBranches`. App-server uses the vendored sessionful transport; `exec` uses the same lifecycle with a different turn transport.
+   Spawn one reviewer per reviewable entry, then replace that entry's `review: null` with the reviewer's structured result. Recompute `approvedBranches` from the completed entries; do not trust the runner's initially empty `approvedBranches`. App-server uses the vendored sessionful transport; `exec` uses the same lifecycle with a different turn transport.
 2. **Agent-tool orchestration** is the fallback for stock installs without a usable absolute `nodeExe` and for `mode === 'claude'`: use the prose procedure further down.
 
 ## Historical workflow-engine reference

@@ -219,6 +219,18 @@ function mergeContinuation(first, followUp) {
   }, [...(first.events ?? []), ...(followUp.events ?? [])]);
 }
 
+// A `timers/promises` delay that LOSES a Promise.race is never cleared and holds
+// the event loop until it fires — so a 10-minute turn timeout kept the process
+// alive ~10 minutes after the work finished. Abort the timer when the race
+// settles; an aborted timer resolves to a never-settling promise so it can
+// never win a race it already lost.
+function raceTimeout(ms, signal) {
+  return delay(ms, undefined, { signal }).then(
+    () => ({ kind: "timeout" }),
+    () => new Promise(() => {}),
+  );
+}
+
 function settledWithin(promise, timeoutMs) {
   let timer;
   return Promise.race([
@@ -394,21 +406,32 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
       }
 
       const remaining = Math.max(0, deadline - Date.now());
-      let terminalRace = await Promise.race([
-        terminalPromise.then((note) => ({ kind: "terminal", note })),
-        transportFailure.then((event) => ({ kind: "transport", event })),
-        delay(remaining).then(() => ({ kind: "timeout" })),
-      ]);
+      const raceAbort = new AbortController();
+      let terminalRace;
+      try {
+        terminalRace = await Promise.race([
+          terminalPromise.then((note) => ({ kind: "terminal", note })),
+          transportFailure.then((event) => ({ kind: "transport", event })),
+          raceTimeout(remaining, raceAbort.signal),
+        ]);
+      } finally {
+        raceAbort.abort();
+      }
 
       if (terminalRace.kind === "timeout") {
         lastTurnTimedOut = true;
         recordEvent(state, { type: "turn", threadId: session.threadId, turnId, status: "interrupted", reason: "timeout" });
         await session.interruptCurrent();
-        terminalRace = await Promise.race([
-          terminalPromise.then((note) => ({ kind: "terminal", note })),
-          transportFailure.then((event) => ({ kind: "transport", event })),
-          delay(INTERRUPT_GRACE_MS).then(() => ({ kind: "grace-expired" })),
-        ]);
+        const graceAbort = new AbortController();
+        try {
+          terminalRace = await Promise.race([
+            terminalPromise.then((note) => ({ kind: "terminal", note })),
+            transportFailure.then((event) => ({ kind: "transport", event })),
+            raceTimeout(INTERRUPT_GRACE_MS, graceAbort.signal).then(() => ({ kind: "grace-expired" })),
+          ]);
+        } finally {
+          graceAbort.abort();
+        }
       }
 
       if (terminalRace.kind !== "terminal") {
