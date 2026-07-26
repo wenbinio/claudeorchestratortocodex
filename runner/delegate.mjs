@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { startCodexSession } from "../vendor/dynamic-workflows-codex/src/codexSession.js";
 
-const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 30_000; // bounded idle tail; every run ends with this much silence, so keep it short
 const DEFAULT_POLL_MS = 2_000;
 const VERIFY_OUTPUT_LIMIT = 64 * 1024;
 const REPLAYED_TERMINAL = Symbol("delegate-replayed-terminal");

@@ -69,7 +69,7 @@ Without any Codex auth at all, the plugin still runs: it falls back to Claude su
 
 ## Architecture at a glance
 
-- **Two skills** — `setup` (once-per-machine bootstrap) and `dispatch` (the orchestrator).
+- **Four skills** — `delegate` (live, in your tree), `solo` (isolated + verified + reviewed), `dispatch` (parallel batches), and `setup` (once-per-machine bootstrap).
 - **One runner-first lifecycle** (`runner/task-runner.mjs`): worktree → Codex turn(s) → quiescence → verify → one correction round → checked commit → transcript. Two transports sit behind it — **app-server** (sessionful Codex threads over `codex app-server` JSON-RPC; selected when Node ≥ 18 and the probe passes) and **exec** (`codex exec` shelling). The former Workflow-tool engine survives only as `docs/reference/v2-workflow-engine.js`, a historical, non-normative reference.
 - **Two agents** — `codex-driver` (orchestrates and verifies, never edits source itself) and `fleet-reviewer` (adversarial; tools mechanically restricted to no-write; must re-run verify).
 - **One merge-guard hook** (`Bash` + `PowerShell` scripts) — a PreToolUse seatbelt that blocks Claude-tool merges of `codex/*` branches whose tip SHA has no recorded `approve`.
