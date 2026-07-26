@@ -7,7 +7,7 @@ description: Use when the user wants live, steerable delegation of a coding task
 
 ## Configure
 
-1. Resolve `dataDir` to `${CLAUDE_PLUGIN_DATA}` when available; otherwise glob `~/.claude/plugins/data/*codex-fleet*/` (the on-disk id may be plugin-name or marketplace-qualified); otherwise use `~/.claude/plugins/data/codex-fleet/`.
+1. Resolve `dataDir` exactly as setup and later readers do: use non-empty `${CLAUDE_PLUGIN_DATA}` verbatim; otherwise choose the lexicographically-first `~/.claude/plugins/data/*codex-fleet*/` directory containing `config.json`, then the lexicographically-first match, then `~/.claude/plugins/data/codex-fleet/`.
 2. Read `${dataDir}/config.json`. If missing, stop, run `/codex-fleet:setup`, then re-read it. Never guess paths or authentication. Require absolute existing `codexExe` and `nodeExe`; if either path no longer exists (the Codex binary path is hash-versioned and drifts on app updates), re-run setup before continuing. Use configured `model` and `effort` verbatim.
 3. Delegate requires the app-server backend — it holds one live thread open. If `config.backend !== "app-server"`, stop and tell the user plainly: delegate is unavailable on this machine's backend; use `/codex-fleet:solo` (which works on either) or re-run `/codex-fleet:setup` to re-probe. Do not launch the runner and let it die inside the transport.
 

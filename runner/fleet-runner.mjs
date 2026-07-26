@@ -6,6 +6,7 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { resolveDataDir } from "./lib/data-dir.mjs";
 import { runTask } from "./task-runner.mjs";
 
 const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
@@ -244,14 +245,10 @@ async function runProcess(command, args, { timeoutMs } = {}) {
   });
 }
 
-function pluginDataDir() {
-  return path.resolve(process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), ".claude", "plugins", "data", "codex-fleet"));
-}
-
-function cleanupWorktreeBase(cfg) {
+async function cleanupWorktreeBase(cfg) {
   if (cfg.wtBase) return path.resolve(cfg.wtBase);
   if (cfg.outDir) return path.join(path.resolve(cfg.outDir), "worktrees");
-  if (cfg.runId) return path.join(pluginDataDir(), "runs", cfg.runId, "worktrees");
+  if (cfg.runId) return path.join(await resolveDataDir(), "runs", cfg.runId, "worktrees");
   throw new CliError("cleanup batch needs wtBase, outDir, or runId to locate the original worktrees");
 }
 
@@ -274,7 +271,7 @@ async function cleanupBatch(args) {
   validateCleanupBatch(cfg);
 
   const repo = path.resolve(cfg.repo);
-  const worktreeBase = cleanupWorktreeBase(cfg);
+  const worktreeBase = await cleanupWorktreeBase(cfg);
   const summary = {
     worktreeBase,
     deleteBranches: args.deleteBranches,
@@ -526,7 +523,7 @@ async function runBatch(args) {
 
   const repo = path.resolve(cfg.repo);
   const runId = cfg.runId ?? defaultRunId();
-  const outDir = path.resolve(cfg.outDir || path.join(pluginDataDir(), "runs", runId));
+  const outDir = path.resolve(cfg.outDir || path.join(await resolveDataDir(), "runs", runId));
   await assertExternalRunDirectory(repo, outDir);
 
   const worktreeBase = cfg.wtBase ? path.resolve(cfg.wtBase) : path.join(outDir, "worktrees");

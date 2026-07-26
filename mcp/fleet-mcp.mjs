@@ -2,9 +2,10 @@
 
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fsp } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+
+import { resolveDataDir } from "../runner/lib/data-dir.mjs";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
 const TERMINAL_STATUSES = new Set(["done", "interrupted", "failed"]);
@@ -77,22 +78,6 @@ function requireString(value, name) {
 function requireOnlyKeys(value, allowed) {
   const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
   if (unexpected) throw new Error(`unexpected argument: ${unexpected}`);
-}
-
-async function dataDirectory() {
-  if (process.env.CLAUDE_PLUGIN_DATA) return path.resolve(process.env.CLAUDE_PLUGIN_DATA);
-
-  const parent = path.join(os.homedir(), ".claude", "plugins", "data");
-  try {
-    const matches = (await fsp.readdir(parent, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && entry.name.includes("codex-fleet"))
-      .map((entry) => entry.name)
-      .sort();
-    if (matches.length) return path.join(parent, matches[0]);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  return path.join(parent, "codex-fleet");
 }
 
 function isInside(parent, candidate) {
@@ -318,7 +303,7 @@ async function delegateInterrupt(dataDir, runDir) {
 
 async function callTool(name, rawArguments) {
   const args = rawArguments === undefined ? {} : requireObject(rawArguments, "arguments");
-  const dataDir = await dataDirectory();
+  const dataDir = await resolveDataDir();
   switch (name) {
     case "fleet_runs":
       requireOnlyKeys(args, []);

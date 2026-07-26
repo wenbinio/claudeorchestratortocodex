@@ -9,7 +9,7 @@ Run one grounded Codex task through the fleet safety gates without multi-task pl
 
 ## Configure
 
-1. Resolve `dataDir` to `${CLAUDE_PLUGIN_DATA}` when available; otherwise glob `~/.claude/plugins/data/*codex-fleet*/` (the on-disk id may be plugin-name or marketplace-qualified); otherwise use `~/.claude/plugins/data/codex-fleet/`.
+1. Resolve `dataDir` exactly as setup and later readers do: use non-empty `${CLAUDE_PLUGIN_DATA}` verbatim; otherwise choose the lexicographically-first `~/.claude/plugins/data/*codex-fleet*/` directory containing `config.json`, then the lexicographically-first match, then `~/.claude/plugins/data/codex-fleet/`.
 2. Read `${dataDir}/config.json`. If missing, stop, run `/codex-fleet:setup`, then re-read it. Never guess paths or authentication. Require absolute existing `codexExe` and `nodeExe`; compare their current versions with `codexVersion` and `nodeVersion`, and re-run setup for stale paths or versions. Use configured `backend`, `model`, and `effort` verbatim.
 
 ## Ground one task

@@ -10,7 +10,7 @@ Discover the local Codex CLI, verify non-interactive authentication, and write m
 ## Resolve the platform and data directory
 
 1. Detect `windows` versus `posix` and use exactly that lowercase value for `platform`.
-2. Resolve the data directory to `${CLAUDE_PLUGIN_DATA}` when it is available; otherwise use `~/.claude/plugins/data/codex-fleet/`.
+2. Resolve `dataDir` exactly as setup and later readers do: use non-empty `${CLAUDE_PLUGIN_DATA}` verbatim; otherwise choose the lexicographically-first `~/.claude/plugins/data/*codex-fleet*/` directory containing `config.json`, then the lexicographically-first match, then `~/.claude/plugins/data/codex-fleet/`.
 3. Create that data directory if needed. The target is `<dataDir>/config.json`.
 
 ## Discover Codex
