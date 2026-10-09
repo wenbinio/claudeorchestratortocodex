@@ -1,5 +1,7 @@
 # Codex Fleet
 
+Version **0.6.2**
+
 **Claude plans, reviews, and integrates; Codex writes the code — and nothing lands until an adversarial reviewer independently re-runs the tests and passes it.**
 
 Codex Fleet is a Claude Code plugin that treats LLM-generated code as an untrusted supply chain. You describe the work; Claude drafts grounded task specs and dispatches OpenAI Codex (`gpt-5.6-sol`) workers; each worker runs in its own isolated Git worktree; the Claude driver verifies the result *outside* Codex's sandbox; a separate adversarial reviewer re-runs the verification independently before anything is approved; and only approved work is integrated — landing as one verified, staged diff in your working tree, exactly like a native Claude Code edit.
@@ -55,7 +57,7 @@ Use dispatch when you want a batch:
 
 The three tiers are: `delegate` (live, steerable, your tree, you review) / `solo` (isolated, verified, adversarially reviewed) / `dispatch` (parallel batches, full pipeline).
 
-`setup` runs once per machine: it discovers your Codex CLI, verifies non-interactive auth with a trivial READY smoke, probes the runner backend, and writes machine-local config to the plugin data directory (never into the repo). `dispatch` plans the tasks, runs the fleet, records verdicts, and integrates only approved branches.
+`setup` runs once per machine: it discovers your Codex CLI, verifies non-interactive auth **and successful shell execution**, probes the runner backend, and writes the passing worker settings to machine-local config in the plugin data directory. `dispatch` plans the tasks, runs the fleet, records verdicts, and integrates only approved branches.
 
 ## Requirements
 
@@ -85,10 +87,14 @@ The default `stage` integration mode is the flagship behavior. Approved branches
 Each Codex worker gets a transcript — prompt, command timeline with exit statuses, patched files, final message, and token/duration usage — and the run report links to each one. Workers are non-ephemeral, so sessions also appear in the Codex app, and you can interrogate one afterward:
 
 ```sh
-codex exec resume <sessionId>
+codex exec resume --disable plugins -c mcp_servers.node_repl.enabled=false -m <model> -c model_reasoning_effort="<effort>" <sessionId>
 ```
 
 Every fleet commit also carries `Codex-Fleet-Task:` and `Codex-Session:` trailers, so the fleet log and your git history form a traceable audit trail in both directions.
+
+### Windows: workers that can talk but cannot run commands
+
+Bundled plugins and `[mcp_servers.node_repl]` can start `node_repl.exe`; Windows sandbox setup checks its ACL before **every command** and cannot open the running executable for writing. Such workers may still answer or generate images while commands and file writes fail with `setup refresh had errors`. Workers default to `isolation: "plugins-off"` (`--disable plugins -c mcp_servers.node_repl.enabled=false`), preserving other user config; `"ignore-user-config"` drops user config and requires an explicit model on exec (app-server falls back to plugins-off with a result note); `"none"` retains plugins and MCP settings. Isolation prevents the worker from starting these helpers, but the Codex desktop app can still hold the executable open: close the app, or explicitly choose `windowsSandbox: "unelevated"`, **a weaker sandbox** (`elevated` is also supported; unset preserves the user's setting). Setup tries plugins-off, then plugins-off + unelevated on Windows, then config-free exec if needed; it records unelevated only with `/codex-fleet:setup --allow-unelevated`. Results identify `failureReason: "sandbox_setup_failed"`, give these remedies, and skip automatic continuation/correction retries. Windows sandboxed workers also run as a different user, so git may fail with `dubious ownership`: the driver runs git, not Codex.
 
 ### MCP surface
 
@@ -147,7 +153,7 @@ The runner works outside a Claude session. It performs only the *dispatch* phase
 node runner/fleet-runner.mjs --batch batch.json
 ```
 
-The batch is `{repo, codexExe, backend, tasks:[{id, spec, verify?}], model?, effort?, timeoutMinutes?}`; results are written to the run's external output directory.
+The batch is `{repo, codexExe, backend, tasks:[{id, spec, verify?}], model?, effort?, isolation?, windowsSandbox?, timeoutMinutes?}`; results are written to the run's external output directory. `isolation` accepts `plugins-off` (default), `ignore-user-config`, or `none`; `windowsSandbox` accepts `elevated` or `unelevated` and applies on both transports in every isolation mode as `-c windows.sandbox="<value>"`. Unknown values are errors. Config and batch fields use the same names; delegate task JSON accepts both too. `ignore-user-config` always requires a non-empty `model` and never implicitly sets the Windows sandbox.
 
 ## Attribution
 
@@ -160,9 +166,14 @@ Vendored code under `vendor/` retains its own upstream MIT license and copyright
 
 ## Runner CLI modes
 
-The standalone runner (`node runner/fleet-runner.mjs`) has four modes:
+The standalone runner (`node runner/fleet-runner.mjs`) has five modes:
 
 - `--batch <batch.json>` — run a fleet batch. Prints one `[fleet] <task> <state>` progress line per task transition on stderr, and rewrites `results.json` atomically after each task completes (`complete: false` until the run ends), so an interrupted run always leaves salvageable state. Ctrl-C interrupts active workers cleanly and records unfinished tasks as `interrupted`.
 - `--resume <batch.json>` — re-run a batch, skipping tasks already `done` whose branch tip still matches the recorded commit; stale worktrees/branches of non-done tasks are cleaned before re-dispatch.
-- `--probe` — verify the app-server backend end-to-end (initialize, model list, one ephemeral read-only turn); used by `setup`.
+- `--probe` — verify app-server end-to-end (initialize, model list, ephemeral read-only turn with a successful shell command); used by `setup`. Pass `--codex-exe`, `--model`, `--effort`, `--isolation`, and optional `--windows-sandbox` from the passing smoke.
+- `--smoke` — run the exec shell smoke and select working isolation settings. Pass `--codex-exe`, `--model`, and `--effort`; `--allow-unelevated` explicitly permits selecting the weaker Windows sandbox. JSON output reports attempts and the settings to save to config; a chat-only worker fails.
 - `--cleanup <batch.json>` — remove the batch's worktrees (`--delete-branches` additionally deletes unmerged `codex/*` branches). Prints a JSON summary.
+
+## Changelog
+
+- **0.6.2** — Isolate Codex worker plugins/MCP helpers by default, support explicit Windows sandbox overrides, classify sandbox setup failures with remedies, and require a shell-execution setup smoke with opt-in for the weaker unelevated sandbox.

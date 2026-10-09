@@ -2,18 +2,22 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fsp } from "node:fs";
+import { promises as fsp, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { resolveDataDir } from "./lib/data-dir.mjs";
 import { runTask } from "./task-runner.mjs";
+import { appServerArgs, validateWorkerConfig, workerIsolationNotes } from "./codex-flags.mjs";
+import { classifySandboxFailure, SANDBOX_SETUP_REMEDY } from "./sandbox-failure.mjs";
+import { runSetupSmoke, shellSmokePassed, shellSmokePrompt } from "./setup-smoke.mjs";
 
 const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 const DEFAULT_MAX_PARALLEL = 4;
 const PROBE_TIMEOUT_MS = 60_000;
 const GIT_TIMEOUT_MS = 30_000;
-const USAGE = "usage: fleet-runner.mjs --batch <batch.json> [--resume] | --probe | --cleanup <batch.json> [--delete-branches]";
+const USAGE = "usage: fleet-runner.mjs --batch <batch.json> [--resume] | --probe | --smoke [--allow-unelevated] | --cleanup <batch.json> [--delete-branches]";
 const TRANSPORT_URLS = {
   "app-server": new URL("./transports/app-server.mjs", import.meta.url),
   exec: new URL("./transports/exec.mjs", import.meta.url),
@@ -27,7 +31,7 @@ class CliError extends Error {
   }
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = { batch: null, cleanup: null, deleteBranches: false, probe: false, resume: false };
   const valueOptions = new Map([
     ["--batch", "batch"],
@@ -37,12 +41,15 @@ function parseArgs(argv) {
     ["--model", "model"],
     ["--effort", "effort"],
     ["--timeout-ms", "timeoutMs"],
+    ["--isolation", "isolation"],
+    ["--windows-sandbox", "windowsSandbox"],
+    ["--codex-args", "codexArgsJson"],
   ]);
 
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
-    if (option === "--probe") {
-      args.probe = true;
+    if (option === "--probe" || option === "--smoke" || option === "--allow-unelevated") {
+      args[option === "--probe" ? "probe" : option === "--smoke" ? "smoke" : "allowUnelevated"] = true;
       continue;
     }
     if (option === "--delete-branches") {
@@ -60,10 +67,22 @@ function parseArgs(argv) {
     index += 1;
   }
 
-  const modes = [Boolean(args.batch), args.probe, Boolean(args.cleanup)].filter(Boolean).length;
-  if (modes > 1) throw new CliError("use exactly one of --batch, --probe, or --cleanup");
+  const modes = [Boolean(args.batch), args.probe, args.smoke, Boolean(args.cleanup)].filter(Boolean).length;
+  if (modes > 1) throw new CliError("use exactly one of --batch, --probe, --smoke, or --cleanup");
   if (args.deleteBranches && !args.cleanup) throw new CliError("--delete-branches requires --cleanup");
   if (args.resume && !args.batch) throw new CliError("--resume requires --batch");
+  if (args.allowUnelevated && !args.smoke) throw new CliError("--allow-unelevated requires --smoke");
+  if (args.codexArgsJson !== undefined) {
+    try {
+      args.codexArgs = JSON.parse(args.codexArgsJson);
+      if (!Array.isArray(args.codexArgs) || args.codexArgs.some((arg) => typeof arg !== "string")) throw new Error();
+    } catch {
+      throw new CliError("--codex-args requires a JSON array of strings");
+    }
+  }
+  if (args.probe || args.smoke) {
+    try { validateWorkerConfig(args); } catch (error) { throw new CliError(error.message); }
+  }
   return args;
 }
 
@@ -104,7 +123,7 @@ async function assertExternalRunDirectory(repo, outDir) {
   }
 }
 
-function validateBatch(raw) {
+export function validateBatch(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new CliError("batch must be a JSON object");
   }
@@ -125,6 +144,11 @@ function validateBatch(raw) {
   }
   if (raw.effort != null && typeof raw.effort !== "string") {
     throw new CliError("batch effort must be a string when provided");
+  }
+  try {
+    validateWorkerConfig(raw);
+  } catch (error) {
+    throw new CliError(error.message);
   }
   if (raw.runId != null && (typeof raw.runId !== "string" || !raw.runId.trim())) {
     throw new CliError("batch runId must be a non-empty string when provided");
@@ -410,8 +434,9 @@ async function deleteBranchAtTip(repo, branch, expectedTip) {
   }
 }
 
-function taskCacheKey(repoRealpath, baseSha, task, backend, model, effort) {
-  const identity = [repoRealpath, baseSha, task.spec, task.verify || "", backend, model || "", effort || ""];
+function taskCacheKey(repoRealpath, baseSha, task, backend, model, effort, isolation, windowsSandbox) {
+  const identity = [repoRealpath, baseSha, task.spec, task.verify || "", backend, model || "", effort || "",
+    isolation ?? "plugins-off", windowsSandbox ?? ""];
   return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
@@ -604,7 +629,7 @@ async function runBatch(args) {
     if (interruptionRequested) return;
     const repoRealpath = await fsp.realpath(repo);
     for (const task of cfg.tasks) {
-      cacheKeys.set(task.id, taskCacheKey(repoRealpath, baseSha, task, cfg.backend, cfg.model, cfg.effort));
+      cacheKeys.set(task.id, taskCacheKey(repoRealpath, baseSha, task, cfg.backend, cfg.model, cfg.effort, cfg.isolation, cfg.windowsSandbox));
     }
 
     if (args.resume) {
@@ -732,6 +757,8 @@ async function runBatch(args) {
           cwd: worktree,
           model: cfg.model,
           effort: cfg.effort,
+          isolation: cfg.isolation,
+          windowsSandbox: cfg.windowsSandbox,
           onEvent: (event) => events.push(event),
         });
         activeWorkers.set(taskIndex, worker);
@@ -816,7 +843,7 @@ function modelName(model) {
   return model?.id ?? model?.model ?? model?.slug ?? model?.name ?? null;
 }
 
-async function probe(args) {
+export async function probe(args) {
   const result = {
     compatible: false,
     backend: "app-server",
@@ -828,6 +855,10 @@ async function probe(args) {
     sandbox: "read-only",
     turnStatus: "failed",
     finalMessage: "",
+    shellCommandPassed: false,
+    isolation: args.isolation === "ignore-user-config" ? "plugins-off" : args.isolation ?? "plugins-off",
+    ...(args.windowsSandbox ? { windowsSandbox: args.windowsSandbox } : {}),
+    notes: workerIsolationNotes(args, "app-server"),
   };
   const codexExe = args.codexExe || process.env.CODEX_EXE || process.env.CODEX_CLI_PATH || "codex";
   const requestedTimeout = Number(args.timeoutMs);
@@ -836,14 +867,17 @@ async function probe(args) {
   let client = null;
   let threadId = null;
   let turnId = null;
+  const events = [];
+  const token = `FLEET_SHELL_${randomUUID().replaceAll("-", "")}`;
 
   try {
     probeDir = args.cwd ? path.resolve(args.cwd) : await fsp.mkdtemp(path.join(os.tmpdir(), "codex-fleet-probe-"));
     const { AppServerClient } = await import("../vendor/dynamic-workflows-codex/src/appServerClient.js");
     client = new AppServerClient({
       command: codexExe,
+      args: appServerArgs(args),
       cwd: probeDir,
-      clientInfo: { name: "codex-fleet-probe", title: "Codex Fleet Probe", version: "0.3.0" },
+      clientInfo: { name: "codex-fleet-probe", title: "Codex Fleet Probe", version: "0.6.2" },
       capabilities: { experimentalApi: true },
       requestHandler: probeRequestHandler,
     });
@@ -872,10 +906,16 @@ async function probe(args) {
     let resolveTransportFailure;
     const transportFailure = new Promise((resolve) => { resolveTransportFailure = resolve; });
     const onNotification = (note) => {
+      if (note.params?.threadId && note.params.threadId !== threadId) return;
+      events.push({ raw: note });
       if (note?.method === "item/completed" && note.params?.threadId === threadId) {
         const item = note.params?.item;
         if ((item?.type === "agentMessage" || item?.type === "agent_message") && typeof item.text === "string") {
           result.finalMessage = item.text;
+        }
+        if (item?.type === "commandExecution" || item?.type === "command_execution") {
+          events.push({ type: "commandExecution", exitCode: item.exitCode ?? item.exit_code ?? null,
+            output: item.aggregatedOutput ?? item.aggregated_output ?? "" });
         }
       }
       if (note?.method !== "turn/completed" || note.params?.threadId !== threadId) return;
@@ -893,7 +933,7 @@ async function probe(args) {
     try {
       const started = await client.startTurn({
         threadId,
-        input: [{ type: "text", text: "Reply with exactly the single word: READY" }],
+        input: [{ type: "text", text: shellSmokePrompt(token) }],
         ...(args.model ? { model: args.model } : {}),
         ...(args.effort ? { effort: args.effort } : {}),
       });
@@ -919,14 +959,26 @@ async function probe(args) {
       }
 
       result.turnStatus = outcome.note.params?.turn?.status ?? "failed";
-      result.compatible = result.initialized && result.modelsListed && result.turnStatus === "completed" && result.finalMessage.trim() === "READY";
-      if (!result.compatible) result.error = "probe turn did not complete with READY";
+      const turnResult = classifySandboxFailure({ status: result.turnStatus, finalMessage: result.finalMessage }, events);
+      result.shellCommandPassed = shellSmokePassed(turnResult, events, token);
+      result.compatible = result.initialized && result.modelsListed && result.shellCommandPassed;
+      if (turnResult.failureReason) {
+        result.failureReason = turnResult.failureReason;
+        result.remedy = turnResult.remedy;
+      }
+      if (!result.compatible) result.error = `probe worker did not successfully execute the shell smoke. ${SANDBOX_SETUP_REMEDY}`;
     } finally {
       client.off("notification", onNotification);
       client.off("transport", onTransport);
     }
   } catch (error) {
     result.error = error?.message ?? String(error);
+    const failure = classifySandboxFailure({}, [result.error, ...events]);
+    if (failure.failureReason) {
+      result.failureReason = failure.failureReason;
+      result.remedy = failure.remedy;
+      result.error = `${result.error} ${failure.remedy}`;
+    }
   } finally {
     await client?.shutdown().catch(() => {});
     if (probeDir && !args.cwd) await fsp.rm(probeDir, { recursive: true, force: true }).catch(() => {});
@@ -937,6 +989,16 @@ async function probe(args) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.smoke) {
+    const capability = await runSetupSmoke({ ...args,
+      codexExe: args.codexExe || process.env.CODEX_EXE || process.env.CODEX_CLI_PATH || "codex",
+      cwd: args.cwd ? path.resolve(args.cwd) : process.cwd(),
+      timeoutMs: Number(args.timeoutMs) || PROBE_TIMEOUT_MS,
+    });
+    console.log(JSON.stringify(capability));
+    process.exitCode = capability.compatible ? 0 : 1;
+    return;
+  }
   if (args.probe) {
     const capability = await probe(args);
     console.log(JSON.stringify(capability));
@@ -952,7 +1014,9 @@ async function main() {
   process.exitCode = 0;
 }
 
-main().catch((error) => {
-  console.error(`fatal: ${error?.message ?? String(error)}`);
-  process.exitCode = error?.exitCode ?? 1;
-});
+if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    console.error(`fatal: ${error?.message ?? String(error)}`);
+    process.exitCode = error?.exitCode ?? 1;
+  });
+}

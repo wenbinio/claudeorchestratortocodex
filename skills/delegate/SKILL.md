@@ -11,6 +11,10 @@ description: Use when the user wants live, steerable delegation of a coding task
 2. Read `${dataDir}/config.json`. If missing, stop, run `/codex-fleet:setup`, then re-read it. Never guess paths or authentication. Require absolute existing `codexExe` and `nodeExe`; if either path no longer exists (the Codex binary path is hash-versioned and drifts on app updates), re-run setup before continuing. Use configured `model` and `effort` verbatim.
 3. Delegate requires the app-server backend — it holds one live thread open. If `config.backend !== "app-server"`, stop and tell the user plainly: delegate is unavailable on this machine's backend; use `/codex-fleet:solo` (which works on either) or re-run `/codex-fleet:setup` to re-probe. Do not launch the runner and let it die inside the transport.
 
+Pass configured `isolation` and optional `windowsSandbox` into the task JSON. Validate `isolation` as `plugins-off` (default), `ignore-user-config`, or `none`, and `windowsSandbox` as `elevated` or `unelevated`; unknown values are errors. Default app-server spawns include `--disable plugins -c mcp_servers.node_repl.enabled=false`. App-server cannot ignore user config, so `ignore-user-config` requires a model and falls back to plugins-off with a result note. `none` omits isolation flags. A Windows override adds `-c windows.sandbox="<value>"` in every mode; unset preserves the user's setting. Unelevated is a weaker sandbox and must be explicitly selected.
+
+On Windows the sandboxed worker runs as a different user, so git in the worktree may fail with `dubious ownership`. The driver runs git, never Codex.
+
 ## Prepare the direct task
 
 Take the user's description as the task. This mode edits the current working tree directly: create no worktree and use no review gate. The user is the reviewer.
@@ -29,11 +33,12 @@ Create `runDir = ${dataDir}/runs/delegate-<filesystem-safe-timestamp>` and write
   "runDir": "<the runDir path>",
   "model": "<configured model>",
   "effort": "<configured effort>",
+  "isolation": "<configured isolation, default plugins-off>",
   "verify": "<advisory verify command, omit when unknown>"
 }
 ```
 
-`repo`, `codexExe`, `task`, and `runDir` are required; `model`, `effort`, `verify`, and `isolated` are optional. There is no `cwd` key and no `backend` key.
+`repo`, `codexExe`, `task`, and `runDir` are required; `model`, `effort`, `isolation`, `windowsSandbox`, `verify`, and `isolated` are optional. Add `windowsSandbox` only when configured. `isolated` controls worktree creation and is separate from worker `isolation`. There is no `cwd` key and no `backend` key.
 
 ## Spawn one narrator wrapper
 
@@ -46,6 +51,8 @@ Spawn exactly one narrator wrapper agent **in the background** (the main session
 5. At terminal state, report files changed (the DELTA against the baseline you recorded), the advisory verification outcome (or that none ran), how the user can steer next time by telling the main session `tell it to ...`, and the run-directory path.
 
 The runner owns `events.jsonl`, `state.json`, and the `steer.inbox/` directory (one JSON file per message, written atomically); consume them through this contract rather than inventing another channel.
+
+If command results contain `setup refresh had errors`, the runner records `failureReason: "sandbox_setup_failed"` and a remedy in state and summary, then stops without another turn or advisory verify. Surface it: use `isolation: "plugins-off"` (or exec-only `ignore-user-config` with a model), close the Codex desktop app (it runs `node_repl.exe`), or explicitly opt in to `windowsSandbox: "unelevated"`, a weaker sandbox. Report any fallback notes.
 
 ## Main-session duties
 

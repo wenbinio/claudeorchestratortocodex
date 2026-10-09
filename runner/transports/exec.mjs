@@ -6,6 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { workerIsolationArgs } from "../codex-flags.mjs";
+import { classifySandboxFailure, hasSandboxSetupFailure } from "../sandbox-failure.mjs";
+
 const DEFAULT_TIMEOUT_MS = 600_000;
 const KILL_GRACE_MS = 2_000;
 const CONTINUATION_MIN_MS = 120_000;
@@ -77,6 +80,9 @@ function recordEvent(state, event) {
 }
 
 function collectFrame(frame, state) {
+  if (hasSandboxSetupFailure(frame)) {
+    recordEvent(state, { type: "sandboxFailure", reason: "sandbox_setup_failed", raw: frame });
+  }
   const frameType = frame?.type ?? frame?.method ?? "";
   if (frameType === "thread.started" || frameType === "thread_started") {
     state.sessionId = frame.thread_id ?? frame.threadId ?? frame.thread?.id ?? frame.session_id ?? state.sessionId;
@@ -172,7 +178,7 @@ function contractResult(values, events) {
     sessionId: values.sessionId ?? "",
   };
   Object.defineProperty(result, "events", { value: events, enumerable: false });
-  return result;
+  return classifySandboxFailure(result, events);
 }
 
 function waitForExit(child) {
@@ -184,7 +190,7 @@ function waitForExit(child) {
       resolve(value);
     };
     child.once("error", (error) => finish({ code: null, signal: null, error }));
-    child.once("exit", (code, signal) => finish({ code, signal, error: null }));
+    child.once("close", (code, signal) => finish({ code, signal, error: null }));
   });
 }
 
@@ -231,8 +237,9 @@ async function killProcessTree(child, exitPromise) {
   return stopped;
 }
 
-export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {}) {
+export async function createWorker({ codexExe, codexArgs, cwd, model, effort, isolation, windowsSandbox, sandbox = "workspace-write", ephemeral = false, onEvent } = {}) {
   if (!cwd) throw new TypeError("createWorker requires cwd");
+  const isolationArgs = workerIsolationArgs({ isolation, windowsSandbox, model });
 
   let active = null;
   let closed = false;
@@ -247,7 +254,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
 
     let child;
     try {
-      child = spawn(executable, args, {
+      child = spawn(executable, [...(codexArgs ?? []), ...args], {
         cwd,
         env: { ...process.env, PWD: cwd },
         detached: !isWindows,
@@ -308,11 +315,17 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
         if (!stopped) throw new Error("timed-out codex exec process tree did not terminate");
         await exitPromise;
         acceptStdout("", true);
+        if (hasSandboxSetupFailure(stderrTail.text())) {
+          recordEvent(state, { type: "sandboxFailure", reason: "sandbox_setup_failed", error: stderrTail.text() });
+        }
         return { kind: "timeout" };
       }
 
       acceptStdout("", true);
       const { code, error } = outcome.value;
+      if (hasSandboxSetupFailure(stderrTail.text())) {
+        recordEvent(state, { type: "sandboxFailure", reason: "sandbox_setup_failed", error: stderrTail.text() });
+      }
       return { kind: "exit", code, error, stderrText: stderrTail.text() };
     } finally {
       clearTimeout(timer);
@@ -326,7 +339,8 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
 
     const state = makeState(onEvent);
     const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
-    const flagArgs = ["--json", "--sandbox", "workspace-write"];
+    const flagArgs = [...isolationArgs, "--json", "--sandbox", sandbox];
+    if (ephemeral) flagArgs.push("--ephemeral");
     if (model) flagArgs.push("-m", String(model));
     if (effort) flagArgs.push("-c", `model_reasoning_effort=${JSON.stringify(String(effort))}`);
     // Windows caps command lines near 32KB, so the prompt travels by file →
@@ -341,7 +355,7 @@ export async function createWorker({ codexExe, cwd, model, effort, onEvent } = {
       // here) earns exactly ONE `codex exec resume <sessionId> continue` with
       // half the original window (min 2 minutes). No captured sessionId → skip.
       // Structurally loop-free: the resume outcome is never continued again.
-      if (outcome.kind === "timeout" && state.sessionId && !closed) {
+      if (outcome.kind === "timeout" && state.sessionId && !closed && !state.events.some(hasSandboxSetupFailure)) {
         const continueLimit = Math.max(CONTINUATION_MIN_MS, Math.floor(limit / 2));
         state.terminalStatus = null;
         recordEvent(state, { type: "turn", sessionId: state.sessionId, status: "continuing", reason: "timeout" });

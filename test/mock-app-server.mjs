@@ -110,6 +110,11 @@ async function handle(frame) {
     return;
   }
 
+  if (method === "model/list") {
+    respond(id, { data: [{ id: "gpt-5.6-sol" }] });
+    return;
+  }
+
   if (method === "thread/start") {
     const threadId = `mock-thread-${++threadSequence}`;
     const cwd = path.resolve(params.cwd ?? process.cwd());
@@ -144,6 +149,9 @@ async function handle(frame) {
       error = { message: caught?.message ?? String(caught) };
       finalText = `Mock failed: ${error.message}`;
     }
+    if (prompt.includes("MOCK_SHOW_ARGS")) finalText = JSON.stringify(process.argv.slice(2));
+    const token = /FLEET_SHELL_[a-zA-Z0-9_]+/.exec(prompt)?.[0];
+    if (token) finalText = token;
 
     activeTurns.set(turnId, { threadId, turnId, messageId, prompt });
     respond(id, {
@@ -167,6 +175,18 @@ async function handle(frame) {
       turnId,
       startedAtMs: emittedAtMs,
     });
+
+    if (prompt.includes("MOCK_SANDBOX_SETUP_FAILED") || (token && !process.argv.includes("--mock-chat-only"))) {
+      const sandboxFailed = prompt.includes("MOCK_SANDBOX_SETUP_FAILED") || process.argv.includes("--mock-sandbox-error") ||
+        (process.argv.includes("--mock-require-unelevated") && !process.argv.includes('windows.sandbox="unelevated"'));
+      notify("item/completed", { threadId, turnId, item: {
+        id: `command-${turnId}`, type: "commandExecution", command: `echo ${token ?? "test"}`,
+        status: sandboxFailed ? "failed" : "completed", exitCode: sandboxFailed ? null : 0,
+        aggregatedOutput: sandboxFailed
+          ? "Failed to create unified exec process: helper_unknown_error: setup refresh had errors"
+          : `${token}\n`,
+      } });
+    }
 
     if (!prompt.includes("MOCK_WAIT_FOR_INTERRUPT")) {
       completeTurn({ threadId, turnId, messageId, finalText, status, error, prompt });

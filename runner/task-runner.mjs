@@ -3,6 +3,7 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { classifySandboxFailure } from "./sandbox-failure.mjs";
 
 const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -523,6 +524,15 @@ export async function runTask({
   let usageNote = "";
 
   function absorbTurn(label, outcome) {
+    classifySandboxFailure(outcome, outcome?.events ?? []);
+    if (outcome?.failureReason) {
+      report.failureReason = outcome.failureReason;
+      report.remedy = outcome.remedy;
+    }
+    if (outcome?.notes?.length) {
+      report.notes = [...new Set([...(report.notes ?? []), ...outcome.notes])];
+      timeline.push(...outcome.notes.map((note) => `${label}: ${note}`));
+    }
     report.codexCommandsRun += Number(outcome?.commandsRun ?? 0);
     for (const file of outcome?.filesPatched ?? []) filesPatched.add(file);
     if (outcome?.finalMessage) report.codexFinalMessage = String(outcome.finalMessage).slice(0, 1500);
@@ -586,7 +596,9 @@ export async function runTask({
     const implementation = await worker.turn(prompt, { timeoutMs: turnTimeout });
     absorbTurn("implementation", implementation);
     if (implementation?.status !== "completed") {
-      report.summary = `implementation turn ${implementation?.status ?? "failed"}`;
+      report.summary = report.failureReason
+        ? `${report.failureReason}: ${report.remedy}`
+        : `implementation turn ${implementation?.status ?? "failed"}`;
       usageNote = "implementation did not complete; verification was not started";
       return report;
     }
@@ -634,7 +646,9 @@ export async function runTask({
         const correction = await worker.turn(correctionPrompt, { timeoutMs: turnTimeout });
         absorbTurn("correction", correction);
         if (correction?.status !== "completed") {
-          report.summary = `correction turn ${correction?.status ?? "failed"}`;
+          report.summary = report.failureReason
+            ? `${report.failureReason}: ${report.remedy}`
+            : `correction turn ${correction?.status ?? "failed"}`;
           usageNote = "correction did not complete; a second verification was not started";
           return report;
         }
@@ -691,12 +705,15 @@ export async function runTask({
     report.summary += `status ${report.status}; verifyPassed=${report.verifyPassed}; commands=${report.codexCommandsRun}.`;
     return report;
   } catch (error) {
+    classifySandboxFailure(report, [error?.message]);
     if (error instanceof RunnerInvariantError && error.code === "branch-collision") {
       report.status = "blocked";
       report.summary = error.message;
     } else {
       report.status = "failed";
-      report.summary = `runner error: ${error?.message ?? String(error)}`;
+      report.summary = report.failureReason
+        ? `${report.failureReason}: ${report.remedy}`
+        : `runner error: ${error?.message ?? String(error)}`;
     }
     timeline.push(`${error?.name ?? "Error"}: ${error?.message ?? String(error)}`);
     return report;

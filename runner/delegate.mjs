@@ -2,11 +2,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants, promises as fsp } from "node:fs";
+import { constants as fsConstants, promises as fsp, realpathSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { startCodexSession } from "../vendor/dynamic-workflows-codex/src/codexSession.js";
+import { appServerArgs, validateWorkerConfig, workerIsolationNotes } from "./codex-flags.mjs";
+import { hasSandboxSetupFailure, SANDBOX_SETUP_REMEDY } from "./sandbox-failure.mjs";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30_000; // bounded idle tail; every run ends with this much silence, so keep it short
 const DEFAULT_POLL_MS = 2_000;
@@ -80,7 +83,7 @@ async function pathExists(filePath) {
   }
 }
 
-async function readTask(taskPath) {
+export async function readTask(taskPath) {
   let raw;
   try {
     raw = JSON.parse(await fsp.readFile(path.resolve(taskPath), "utf8"));
@@ -96,6 +99,11 @@ async function readTask(taskPath) {
   if (raw.verify != null && typeof raw.verify !== "string") throw new CliError("verify must be a string when provided");
   if (raw.isolated != null && typeof raw.isolated !== "boolean") throw new CliError("isolated must be a boolean when provided");
   if (raw.codexArgs != null && !Array.isArray(raw.codexArgs)) throw new CliError("codexArgs must be an array when provided");
+  try {
+    validateWorkerConfig(raw);
+  } catch (error) {
+    throw new CliError(error.message);
+  }
   return raw;
 }
 
@@ -277,7 +285,7 @@ async function drainMessageInbox(inboxPath, applyMessage, warn) {
   return applied;
 }
 
-async function runDelegate(taskPath) {
+export async function runDelegate(taskPath) {
   const cfg = await readTask(taskPath);
   const repo = await fsp.realpath(path.resolve(cfg.repo));
   const runDir = path.resolve(cfg.runDir);
@@ -298,6 +306,7 @@ async function runDelegate(taskPath) {
     turns: 0,
     tokens: null,
     verify: null,
+    notes: workerIsolationNotes(cfg, "app-server"),
   };
 
   let ioTail = Promise.resolve();
@@ -370,7 +379,7 @@ async function runDelegate(taskPath) {
       approvalPolicy: "never",
       clientOptions: {
         command: cfg.codexExe,
-        ...(Array.isArray(cfg.codexArgs) && cfg.codexArgs.length ? { args: cfg.codexArgs } : {}),
+        args: appServerArgs(cfg),
         cwd: repo,
         approvalPolicy: "never",
         requestHandler: denyServerRequest,
@@ -383,6 +392,10 @@ async function runDelegate(taskPath) {
       if (!note || note[REPLAYED_TERMINAL]) return;
       const params = note.params ?? {};
       if (params.threadId && params.threadId !== driver.threadId) return;
+      if (hasSandboxSetupFailure(note)) {
+        state.failureReason = "sandbox_setup_failed";
+        state.remedy = SANDBOX_SETUP_REMEDY;
+      }
       if (note.method === "turn/completed" && params.turn?.id) terminalNotes.set(params.turn.id, note);
       const tokens = note.method === "thread/tokenUsage/updated" ? normalizeTokens(params) : null;
       if (tokens) state.tokens = tokens;
@@ -440,6 +453,9 @@ async function runDelegate(taskPath) {
         terminalNotes.delete(handle.turnId);
         await ioTail;
         if (ioError) throw ioError;
+        if (state.failureReason === "sandbox_setup_failed") {
+          throw new Error(`sandbox_setup_failed: ${SANDBOX_SETUP_REMEDY}`);
+        }
 
         if (interrupted || outcome?.status === "interrupted") {
           finalStatus = "interrupted";
@@ -532,6 +548,11 @@ async function runDelegate(taskPath) {
   } catch (error) {
     finalStatus = "failed";
     finalError = error;
+    if (hasSandboxSetupFailure(error?.message)) {
+      state.failureReason = "sandbox_setup_failed";
+      state.remedy = SANDBOX_SETUP_REMEDY;
+      finalError = new Error(`sandbox_setup_failed: ${SANDBOX_SETUP_REMEDY}`);
+    }
   } finally {
     // Freeze the notification stream before writing the summary so that the
     // delegate-summary record is unconditionally the final JSONL line.
@@ -542,7 +563,9 @@ async function runDelegate(taskPath) {
       await transition(finalStatus).catch((error) => { finalError ??= error; finalStatus = "failed"; });
     }
     const filesChanged = await gitStatus(repo).catch(() => []);
-    await appendEvent({ type: "delegate-summary", filesChanged, verify: state.verify }).catch((error) => {
+    await appendEvent({ type: "delegate-summary", filesChanged, verify: state.verify, notes: state.notes,
+      ...(state.failureReason ? { failureReason: state.failureReason, remedy: state.remedy } : {}),
+    }).catch((error) => {
       finalError ??= error;
       finalStatus = "failed";
     });
@@ -608,7 +631,9 @@ async function main() {
   process.exitCode = finalStatus === "done" ? 0 : finalStatus === "interrupted" ? 130 : 1;
 }
 
-main().catch((error) => {
-  process.stderr.write(`fatal: ${error?.message ?? String(error)}\n`);
-  process.exitCode = error?.exitCode ?? 1;
-});
+if (process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    process.stderr.write(`fatal: ${error?.message ?? String(error)}\n`);
+    process.exitCode = error?.exitCode ?? 1;
+  });
+}

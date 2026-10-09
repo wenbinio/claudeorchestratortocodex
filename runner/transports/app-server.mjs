@@ -1,6 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 import { startCodexSession } from "../../vendor/dynamic-workflows-codex/src/codexSession.js";
+import { appServerArgs, workerIsolationNotes } from "../codex-flags.mjs";
+import { classifySandboxFailure, hasSandboxSetupFailure } from "../sandbox-failure.mjs";
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const INTERRUPT_GRACE_MS = 5_000;
@@ -110,6 +112,9 @@ function collectNotification(note, state, threadId) {
   if (!note || note[REPLAYED_TERMINAL]) return;
   const params = note.params ?? {};
   if (params.threadId && params.threadId !== threadId) return;
+  if (hasSandboxSetupFailure(note)) {
+    recordEvent(state, { type: "sandboxFailure", reason: "sandbox_setup_failed", raw: note });
+  }
 
   if (note.method === "item/completed" && params.item) {
     const item = params.item;
@@ -201,10 +206,10 @@ function contractResult(values, events) {
     tokenUsage: values.tokenUsage ?? null,
     sessionId: values.sessionId ?? "",
   };
-  // The core uses this for transcript detail, while the enumerable public shape
-  // remains exactly the frozen transport contract.
+  // Transcript events stay out of serialized results; failures and isolation
+  // fallbacks add public metadata only when relevant.
   Object.defineProperty(result, "events", { value: events, enumerable: false });
-  return result;
+  return classifySandboxFailure(result, events);
 }
 
 function mergeContinuation(first, followUp) {
@@ -258,8 +263,10 @@ function denyServerRequest(request) {
   throw new Error(`Rejected unsupported app-server request: ${method || "(missing method)"}`);
 }
 
-export async function createWorker({ codexExe, codexArgs, cwd, model, effort, onEvent } = {}) {
+export async function createWorker({ codexExe, codexArgs, cwd, model, effort, isolation, windowsSandbox, onEvent } = {}) {
   if (!cwd) throw new TypeError("createWorker requires cwd");
+  const spawnArgs = appServerArgs({ codexArgs, isolation, windowsSandbox, model });
+  const notes = workerIsolationNotes({ isolation }, "app-server");
 
   let driver = null;
   let driverPromise = null;
@@ -288,9 +295,7 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
           approvalPolicy: "never", // buildThreadParams enforces this on thread/start.
           clientOptions: {
             command: codexExe ?? "codex",
-            // Optional spawn-args override — normal runs use the vendored default
-            // (["app-server", "--listen", "stdio://"]); tests inject a mock server.
-            ...(Array.isArray(codexArgs) && codexArgs.length ? { args: codexArgs } : {}),
+            args: spawnArgs,
             cwd,
             approvalPolicy: "never",
             requestHandler: denyServerRequest,
@@ -513,6 +518,7 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
       // close() sets `closed` before interrupting) earns exactly ONE follow-up
       // turn on the same warm thread. `continuationInFlight` makes looping
       // structurally impossible even if this wrapper is ever re-entered.
+      if (notes.length) first.notes = notes;
       if (first.status !== "interrupted" || !lastTurnTimedOut) return first;
       if (!completionSettled || continuationInFlight || closed || broken) return first;
 
@@ -521,7 +527,9 @@ export async function createWorker({ codexExe, codexArgs, cwd, model, effort, on
         lastTurnTimedOut = false;
         const continueLimit = Math.max(CONTINUATION_MIN_MS, Math.floor(limit / 2));
         const followUp = await runTurn("continue", { timeoutMs: continueLimit });
-        return mergeContinuation(first, followUp);
+        const result = mergeContinuation(first, followUp);
+        if (notes.length) result.notes = notes;
+        return result;
       } finally {
         continuationInFlight = false;
       }

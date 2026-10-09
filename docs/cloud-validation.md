@@ -31,11 +31,11 @@ While `/codex-fleet:setup` runs (or run these directly if setup stalls), capture
 
 1. Node present: `node --version` — need >= 18. Record version.
 2. Codex installable: `which codex || npm i -g @openai/codex && which codex`. Record whether the global npm install succeeds in the sandbox and the resulting path.
-3. Auth smoke (API-key mode):
+3. Shell smoke (API-key mode; use a fresh token and the configured model/effort):
    ```sh
-   codex exec --sandbox read-only --ephemeral 'Reply with exactly: READY' < /dev/null
+   codex exec --disable plugins -c mcp_servers.node_repl.enabled=false --json --sandbox read-only --ephemeral -m gpt-5.6-sol -c 'model_reasoning_effort="xhigh"' 'Run a shell command that prints FLEET_SHELL_<random-id>, then reply with that token. Do not run git.' < /dev/null
    ```
-   Record PASS only on exit 0 with final answer `READY`. (Stdin must be redirected from `/dev/null` — without it `codex exec` hangs.)
+   Record PASS only on exit 0, a successful command event (exit code 0) whose output is the token, and a matching final answer. A chat-only response fails. Close stdin with `/dev/null`; preserve the passing `isolation` in config as described in setup.
 4. Read back the written config: `cat "${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/codex-fleet}/config.json"`. Record `authMode` and `backend` (expected: `api_key`, and `app-server` if the runner probe passes, else `exec`).
 
 ## 3. Data-dir persistence across session restart
@@ -89,7 +89,7 @@ For every red row above, record ALL of:
 | 1 | Plugin loads from checked-in settings.json | | |
 | 2a | `node --version` >= 18 | | version: |
 | 2b | Codex installable via npm | | path: |
-| 2c | READY auth smoke with OPENAI_API_KEY | | |
+| 2c | Successful shell smoke with OPENAI_API_KEY | | |
 | 2d | config.json written (authMode / backend) | | values: |
 | 3 | Data dir persists across restart | | path: · persists: yes/no |
 | 4 | Tiny solo/delegate run end-to-end | | summary line: |

@@ -12,6 +12,10 @@ Run one grounded Codex task through the fleet safety gates without multi-task pl
 1. Resolve `dataDir` exactly as setup and later readers do: use non-empty `${CLAUDE_PLUGIN_DATA}` verbatim; otherwise choose the lexicographically-first `~/.claude/plugins/data/*codex-fleet*/` directory containing `config.json`, then the lexicographically-first match, then `~/.claude/plugins/data/codex-fleet/`.
 2. Read `${dataDir}/config.json`. If missing, stop, run `/codex-fleet:setup`, then re-read it. Never guess paths or authentication. Require absolute existing `codexExe` and `nodeExe`; compare their current versions with `codexVersion` and `nodeVersion`, and re-run setup for stale paths or versions. Use configured `backend`, `model`, and `effort` verbatim.
 
+Pass configured `isolation` and optional `windowsSandbox` into the batch. Validate `isolation` as `plugins-off` (default), `ignore-user-config`, or `none`, and `windowsSandbox` as `elevated` or `unelevated`; unknown values are errors. Default exec/resume and app-server launches include `--disable plugins -c mcp_servers.node_repl.enabled=false`. Exec-only `ignore-user-config` replaces these with `--ignore-user-config` and requires an explicit model; app-server falls back to plugins-off with a result note. `none` omits isolation flags. An optional Windows override adds `-c windows.sandbox="<value>"` in every mode; unset preserves the user's setting. Unelevated is a weaker sandbox and must be explicitly selected.
+
+On Windows the sandboxed worker runs as a different user, so git in the worktree may fail with `dubious ownership`. The driver runs git, never Codex.
+
 ## Ground one task
 
 Take the user's description as the only task. Inspect the target files and surrounding code. Write one surgical spec with exact file/symbol anchors, one acceptance condition, allowed files, and an explicit `Do not modify: ...` list. Never ask Codex to run tests; the runner verifies outside its sandbox.
@@ -23,7 +27,7 @@ Choose the project's known verification command. If none is discoverable, ask th
 Create `runId = solo-<filesystem-safe-timestamp>`, `outDir = ${dataDir}/runs/${runId}`, and a temporary batch JSON:
 
 ```json
-{"runId":"solo-<timestamp>","outDir":"<outDir>","repo":"<repo>","codexExe":"<absolute codexExe>","backend":"<backend>","model":"<model>","effort":"<effort>","maxParallel":1,"tasks":[{"id":"solo","spec":"<grounded spec>","verify":"<command>","allowUnverified":false}]}
+{"runId":"solo-<timestamp>","outDir":"<outDir>","repo":"<repo>","codexExe":"<absolute codexExe>","backend":"<backend>","model":"<model>","effort":"<effort>","isolation":"<configured isolation, default plugins-off>","maxParallel":1,"tasks":[{"id":"solo","spec":"<grounded spec>","verify":"<command>","allowUnverified":false}]}
 ```
 
 Run **in the background**, using the absolute `nodeExe`:
@@ -32,7 +36,7 @@ Run **in the background**, using the absolute `nodeExe`:
 "<absolute nodeExe>" "${CLAUDE_PLUGIN_ROOT}/runner/fleet-runner.mjs" --batch <temp-batch.json>
 ```
 
-Act on completion and delete the temporary batch in `finally`. Read `${outDir}/results.json`.
+Add `windowsSandbox` only when configured. Act on completion and delete the temporary batch in `finally`. Read `${outDir}/results.json` and surface any isolation fallback notes. For `failureReason: "sandbox_setup_failed"` (`setup refresh had errors` in command results), do not retry; report the remedy: use `isolation: "plugins-off"` (or exec-only `ignore-user-config` with a model), close the Codex desktop app (it runs `node_repl.exe`), or explicitly opt in to `windowsSandbox: "unelevated"`, a weaker sandbox.
 
 ## Review, record, and stage
 
